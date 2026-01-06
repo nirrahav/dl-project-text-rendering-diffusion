@@ -1,0 +1,25 @@
+# Core
+torch
+torchvision
+
+# Diffusers (Z-Image pipeline support) — install from source per model card
+git+https://github.com/huggingface/diffusers.git
+
+# Hugging Face basics
+transformers
+accelerate
+safetensors
+huggingface_hub
+
+# Utilities
+numpy
+pillow
+tqdm
+pyyaml
+
+# Experiment tracking (optional but helpful)
+tensorboard
+
+# Evaluation (we'll use later)
+pandas
+matplotlib
