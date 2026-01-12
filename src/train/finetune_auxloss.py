@@ -170,9 +170,19 @@ def train(cfg: TrainConfig) -> None:
 
     autocast_enabled = ac_dtype is not None and device.type == "cuda"
 
-    # Optimizer
-    opt = torch.optim.AdamW(transformer.parameters(), lr=cfg.lr)
+    # -------------------------
+    # Optimizer (memory-aware)
+    # -------------------------
+    params = [p for p in transformer.parameters() if p.requires_grad]
 
+    try:
+        import bitsandbytes as bnb
+        opt = bnb.optim.AdamW8bit(params, lr=cfg.lr)
+        print("✅ Using AdamW8bit (bitsandbytes)")
+    except Exception as e:
+        opt = torch.optim.SGD(params, lr=cfg.lr, momentum=0.9)
+        print("⚠️ bitsandbytes not available -> using SGD")
+        print("   reason:", repr(e))
     # Data
     ds = SynthTextDataset(n=cfg.train_samples, image_size=cfg.image_size, seed=cfg.seed)
     dl = DataLoader(
