@@ -19,6 +19,8 @@ class TrainConfig:
     num_steps: int = 800
     grad_accum: int = 4
     max_grad_norm: float = 1.0
+    aux_every: int = 4
+
 
     # Loss weights
     lambda_aux: float = 0.2  # weight for text-region auxiliary loss
