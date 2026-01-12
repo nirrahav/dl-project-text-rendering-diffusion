@@ -49,28 +49,27 @@ def train(cfg: TrainConfig) -> None:
     ensure_dir(cfg.out_dir)
     ensure_dir(cfg.ckpt_dir)
 
-    # Defensive init (prevents UnboundLocalError if file had leftovers during edits)
-    pixel_values = None
-    texts = None
-    bboxes = None
-
-    # --- Load pipeline and components ---
+    # --- Load pipeline ---
     pipe = load_zimage(cfg.model_id, dtype=cfg.dtype, device=cfg.device)
     transformer, vae, scheduler, tokenizer, text_encoder = _get_components(pipe)
 
-    # Freeze VAE + text encoder; fine-tune transformer
+    # Freeze VAE + text encoder
     vae.requires_grad_(False)
     text_encoder.requires_grad_(False)
     transformer.train()
 
     device = torch.device(cfg.device)
-    vae_dtype = next(vae.parameters()).dtype  # fp16/bf16 depending on cfg.dtype
+    vae_dtype = next(vae.parameters()).dtype  # fp16 / bf16
 
     # Optimizer
     opt = torch.optim.AdamW(transformer.parameters(), lr=cfg.lr)
 
-    # Data
-    ds = SynthTextDataset(n=cfg.train_samples, image_size=cfg.image_size, seed=cfg.seed)
+    # Dataset
+    ds = SynthTextDataset(
+        n=cfg.train_samples,
+        image_size=cfg.image_size,
+        seed=cfg.seed,
+    )
     dl = DataLoader(
         ds,
         batch_size=cfg.batch_size,
@@ -79,41 +78,44 @@ def train(cfg: TrainConfig) -> None:
         collate_fn=collate_fn,
         pin_memory=True,
     )
+    dl_iter = iter(dl)
 
-    # Auxiliary loss (CLIP-based text-region consistency)
+    # Auxiliary loss
     aux_loss_fn = CLIPTextRegionLoss(device=cfg.device)
-
-    # Cache alphas_cumprod on device once (does NOT depend on pixel_values)
-    alphas_cumprod = scheduler.alphas_cumprod.to(device)
 
     # Training loop
     step = 0
     pbar = tqdm(total=cfg.num_steps, desc="train")
-    dl_iter = iter(dl)
 
     while step < cfg.num_steps:
-        # --- Fetch batch (ALWAYS define pixel_values/texts/bboxes every step) ---
+        # ------------------------------------------------------------
+        # 1) Fetch batch (ALWAYS defined every iteration)
+        # ------------------------------------------------------------
         try:
             batch = next(dl_iter)
         except StopIteration:
             dl_iter = iter(dl)
             batch = next(dl_iter)
 
-        pixel_values = batch["pixel_values"].to(device, non_blocking=True)  # float32 from dataset
+        pixel_values = batch["pixel_values"].to(device, non_blocking=True)
         texts = batch["texts"]
         bboxes = batch["bboxes"].to(device, non_blocking=True)
 
-        # Match dtype with VAE to avoid conv dtype mismatch
+        # Match dtype with VAE (critical for fp16/bf16)
         pixel_values = pixel_values.to(dtype=vae_dtype)
 
-        # --- 1) Encode images to latents ---
+        # ------------------------------------------------------------
+        # 2) Encode images → latents
+        # ------------------------------------------------------------
         with torch.no_grad():
             latents = vae.encode(pixel_values * 2.0 - 1.0).latent_dist.sample()
             latents = latents * vae.config.scaling_factor
 
         latents = latents.to(dtype=vae_dtype)
 
-        # --- 2) Sample timesteps + noise ---
+        # ------------------------------------------------------------
+        # 3) Flow-matching noise + timestep
+        # ------------------------------------------------------------
         noise = torch.randn_like(latents)
         bsz = latents.shape[0]
         timesteps = torch.randint(
@@ -123,42 +125,66 @@ def train(cfg: TrainConfig) -> None:
             device=device,
             dtype=torch.long,
         )
-        noisy_latents = scheduler.add_noise(latents, noise, timesteps).to(dtype=vae_dtype)
 
-        # --- 3) Text conditioning ---
+        noisy_latents = scheduler.add_noise(latents, noise, timesteps)
+        noisy_latents = noisy_latents.to(dtype=vae_dtype)
+
+        # ------------------------------------------------------------
+        # 4) Text conditioning
+        # ------------------------------------------------------------
         with torch.no_grad():
-            text_inputs = tokenizer(texts, padding=True, truncation=True, return_tensors="pt")
+            text_inputs = tokenizer(
+                texts,
+                padding=True,
+                truncation=True,
+                return_tensors="pt",
+            )
             text_inputs = {k: v.to(device) for k, v in text_inputs.items()}
             enc = text_encoder(**text_inputs).last_hidden_state
 
-        # --- 4) Predict noise (diffusion loss) ---
-        model_out = transformer(hidden_states=noisy_latents, timestep=timesteps, encoder_hidden_states=enc)
+        # ------------------------------------------------------------
+        # 5) Predict noise / flow
+        # ------------------------------------------------------------
+        model_out = transformer(
+            hidden_states=noisy_latents,
+            timestep=timesteps,
+            encoder_hidden_states=enc,
+        )
         pred = model_out.sample if hasattr(model_out, "sample") else model_out
         pred = pred.to(dtype=noisy_latents.dtype)
 
         diffusion_loss = F.mse_loss(pred.float(), noise.float())
 
-        # --- 5) Auxiliary loss: decode predicted x0 -> image -> crop -> CLIP(text) ---
-        a_t = alphas_cumprod[timesteps].view(-1, 1, 1, 1).to(dtype=vae_dtype)
-        x0 = (noisy_latents - torch.sqrt(1 - a_t) * pred) / torch.sqrt(a_t)
-        x0 = x0 / vae.config.scaling_factor
+        # ------------------------------------------------------------
+        # 6) Auxiliary loss (FlowMatch-friendly proxy)
+        # ------------------------------------------------------------
+        # No alphas_cumprod in FlowMatch schedulers.
+        # Use a denoised-latent proxy to keep gradients connected.
+        latents_hat = (noisy_latents - pred) / vae.config.scaling_factor
+        latents_hat = latents_hat.to(dtype=vae_dtype)
 
-        decoded = vae.decode(x0).sample  # [-1,1]
+        decoded = vae.decode(latents_hat).sample  # [-1, 1]
         decoded = (decoded + 1.0) / 2.0
         decoded = decoded.clamp(0, 1)
 
         aux_loss = aux_loss_fn(decoded, bboxes=bboxes, texts=texts)
 
-        # --- Combined loss ---
+        # ------------------------------------------------------------
+        # 7) Combined loss + backward
+        # ------------------------------------------------------------
         loss = diffusion_loss + cfg.lambda_aux * aux_loss
         loss = loss / cfg.grad_accum
         loss.backward()
 
         if (step + 1) % cfg.grad_accum == 0:
-            torch.nn.utils.clip_grad_norm_(transformer.parameters(), cfg.max_grad_norm)
+            torch.nn.utils.clip_grad_norm_(
+                transformer.parameters(),
+                cfg.max_grad_norm,
+            )
             opt.step()
             opt.zero_grad(set_to_none=True)
 
+        # Logging
         if step % 25 == 0:
             pbar.set_postfix(
                 {
@@ -169,6 +195,7 @@ def train(cfg: TrainConfig) -> None:
                 }
             )
 
+        # Checkpoint
         if step > 0 and step % 200 == 0:
             ckpt_path = Path(cfg.ckpt_dir) / f"transformer_step_{step}.pt"
             torch.save(transformer.state_dict(), ckpt_path)
