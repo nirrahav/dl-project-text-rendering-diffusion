@@ -13,7 +13,7 @@ class CLIPTextRegionLoss(torch.nn.Module):
     def __init__(self, clip_id: str = "openai/clip-vit-base-patch32", device: str = "cuda"):
         super().__init__()
         self.device = device
-        self.clip = CLIPModel.from_pretrained(clip_id).to(device)
+        self.clip = CLIPModel.from_pretrained(clip_id, torch_dtype=torch.float16).to(device)
         self.proc = CLIPProcessor.from_pretrained(clip_id)
         self.clip.eval()
         for p in self.clip.parameters():
@@ -34,7 +34,6 @@ class CLIPTextRegionLoss(torch.nn.Module):
         B, _, H, W = image_batch.shape
         assert bboxes.shape[0] == B
 
-        # Crop each region, resize to 224x224 for CLIP
         crops = []
         for i in range(B):
             x1, y1, x2, y2 = bboxes[i].tolist()
@@ -45,18 +44,19 @@ class CLIPTextRegionLoss(torch.nn.Module):
             crops.append(crop)
         crops = torch.cat(crops, dim=0)  # (B,3,224,224)
 
-        # CLIP image features (need CLIP preprocessing normalization)
-        # We'll approximate by using processor's normalization constants manually
-        mean = torch.tensor([0.48145466, 0.4578275, 0.40821073], device=image_batch.device).view(1,3,1,1)
-        std  = torch.tensor([0.26862954, 0.26130258, 0.27577711], device=image_batch.device).view(1,3,1,1)
+        # ✅ Force crops dtype to match CLIP weights dtype (fp16/bf16)
+        clip_dtype = next(self.clip.parameters()).dtype
+        crops = crops.to(dtype=clip_dtype)
+
+        # ✅ Create mean/std in same dtype/device to avoid upcasting to float32
+        mean = torch.tensor([0.48145466, 0.4578275, 0.40821073], device=crops.device, dtype=clip_dtype).view(1, 3, 1, 1)
+        std  = torch.tensor([0.26862954, 0.26130258, 0.27577711], device=crops.device, dtype=clip_dtype).view(1, 3, 1, 1)
         crops_norm = (crops - mean) / std
 
         img_feat = self.clip.get_image_features(pixel_values=crops_norm)
         img_feat = F.normalize(img_feat, dim=-1)
 
-        # Text features (frozen)
-        txt_feat = self._encode_text(texts)
-
-        # cosine distance
-        loss = 1.0 - (img_feat * txt_feat).sum(dim=-1)  # (B,)
+        txt_feat = self._encode_text(texts).to(dtype=img_feat.dtype)
+        loss = 1.0 - (img_feat * txt_feat).sum(dim=-1)
         return loss.mean()
+
