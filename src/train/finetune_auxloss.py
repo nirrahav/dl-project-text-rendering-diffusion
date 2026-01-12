@@ -16,7 +16,6 @@ from src.zimage.pipeline_utils import load_zimage
 
 
 def _get_components(pipe):
-    # We try to access common diffusers component names.
     transformer = getattr(pipe, "transformer", None)
     vae = getattr(pipe, "vae", None)
     scheduler = getattr(pipe, "scheduler", None)
@@ -50,6 +49,11 @@ def train(cfg: TrainConfig) -> None:
     ensure_dir(cfg.out_dir)
     ensure_dir(cfg.ckpt_dir)
 
+    # Defensive init (prevents UnboundLocalError if file had leftovers during edits)
+    pixel_values = None
+    texts = None
+    bboxes = None
+
     # --- Load pipeline and components ---
     pipe = load_zimage(cfg.model_id, dtype=cfg.dtype, device=cfg.device)
     transformer, vae, scheduler, tokenizer, text_encoder = _get_components(pipe)
@@ -59,10 +63,8 @@ def train(cfg: TrainConfig) -> None:
     text_encoder.requires_grad_(False)
     transformer.train()
 
-    # --- Dtypes (critical) ---
-    # Ensure we always match VAE dtype for image->latent and latent->image steps.
-    vae_dtype = next(vae.parameters()).dtype
     device = torch.device(cfg.device)
+    vae_dtype = next(vae.parameters()).dtype  # fp16/bf16 depending on cfg.dtype
 
     # Optimizer
     opt = torch.optim.AdamW(transformer.parameters(), lr=cfg.lr)
@@ -81,13 +83,13 @@ def train(cfg: TrainConfig) -> None:
     # Auxiliary loss (CLIP-based text-region consistency)
     aux_loss_fn = CLIPTextRegionLoss(device=cfg.device)
 
+    # Cache alphas_cumprod on device once (does NOT depend on pixel_values)
+    alphas_cumprod = scheduler.alphas_cumprod.to(device)
+
     # Training loop
     step = 0
     pbar = tqdm(total=cfg.num_steps, desc="train")
     dl_iter = iter(dl)
-
-    # Cache alphas_cumprod on device once
-    alphas_cumprod = scheduler.alphas_cumprod.to(device)
 
     while step < cfg.num_steps:
         # --- Fetch batch (ALWAYS define pixel_values/texts/bboxes every step) ---
@@ -101,25 +103,24 @@ def train(cfg: TrainConfig) -> None:
         texts = batch["texts"]
         bboxes = batch["bboxes"].to(device, non_blocking=True)
 
-        # Match dtype with VAE (fp16/bf16) to avoid conv dtype mismatch
+        # Match dtype with VAE to avoid conv dtype mismatch
         pixel_values = pixel_values.to(dtype=vae_dtype)
 
         # --- 1) Encode images to latents ---
         with torch.no_grad():
-            # pixel_values in [0,1] -> [-1,1]
             latents = vae.encode(pixel_values * 2.0 - 1.0).latent_dist.sample()
             latents = latents * vae.config.scaling_factor
 
         latents = latents.to(dtype=vae_dtype)
 
         # --- 2) Sample timesteps + noise ---
-        noise = torch.randn_like(latents)  # inherits dtype/device from latents
+        noise = torch.randn_like(latents)
         bsz = latents.shape[0]
         timesteps = torch.randint(
             0,
             scheduler.config.num_train_timesteps,
             (bsz,),
-            device=latents.device,
+            device=device,
             dtype=torch.long,
         )
         noisy_latents = scheduler.add_noise(latents, noise, timesteps).to(dtype=vae_dtype)
@@ -131,22 +132,18 @@ def train(cfg: TrainConfig) -> None:
             enc = text_encoder(**text_inputs).last_hidden_state
 
         # --- 4) Predict noise (diffusion loss) ---
-        # IMPORTANT: transformer may expect different arg names depending on diffusers version.
         model_out = transformer(hidden_states=noisy_latents, timestep=timesteps, encoder_hidden_states=enc)
         pred = model_out.sample if hasattr(model_out, "sample") else model_out
-
-        # Keep dtype consistent for subsequent math
         pred = pred.to(dtype=noisy_latents.dtype)
 
         diffusion_loss = F.mse_loss(pred.float(), noise.float())
 
         # --- 5) Auxiliary loss: decode predicted x0 -> image -> crop -> CLIP(text) ---
-        # x0 ≈ (x_t - sqrt(1-a_t)*eps) / sqrt(a_t)
         a_t = alphas_cumprod[timesteps].view(-1, 1, 1, 1).to(dtype=vae_dtype)
         x0 = (noisy_latents - torch.sqrt(1 - a_t) * pred) / torch.sqrt(a_t)
         x0 = x0 / vae.config.scaling_factor
 
-        decoded = vae.decode(x0).sample  # (B,3,H,W) in [-1,1], dtype=vae_dtype
+        decoded = vae.decode(x0).sample  # [-1,1]
         decoded = (decoded + 1.0) / 2.0
         decoded = decoded.clamp(0, 1)
 
@@ -172,7 +169,6 @@ def train(cfg: TrainConfig) -> None:
                 }
             )
 
-        # Save periodic
         if step > 0 and step % 200 == 0:
             ckpt_path = Path(cfg.ckpt_dir) / f"transformer_step_{step}.pt"
             torch.save(transformer.state_dict(), ckpt_path)
@@ -182,7 +178,6 @@ def train(cfg: TrainConfig) -> None:
 
     pbar.close()
 
-    # final save
     ckpt_path = Path(cfg.ckpt_dir) / "transformer_final.pt"
     torch.save(transformer.state_dict(), ckpt_path)
     print(f"Saved: {ckpt_path}")
