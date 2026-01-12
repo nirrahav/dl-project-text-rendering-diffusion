@@ -44,6 +44,50 @@ def _get_components(pipe):
     return transformer, vae, scheduler, tokenizer, text_encoder
 
 
+def _call_zimage_transformer(transformer, noisy_latents, t, enc):
+    """
+    ZImageTransformer2DModel.forward expects:
+      - x: List[Tensor] (or List[List[Tensor]])
+      - t: time / timestep
+      - cap_feats: List[Tensor] (or List[List[Tensor]])
+
+    We pass a single-scale list: x=[noisy_latents], cap_feats=[enc]
+    """
+    # x and cap_feats must be lists (per signature)
+    x = [noisy_latents]
+    cap_feats = [enc]
+
+    out = transformer(x=x, t=t, cap_feats=cap_feats, return_dict=True)
+
+    # Robustly extract prediction from various return types
+    # Possible shapes: dict-like, object with attrs, tuple/list, etc.
+    if isinstance(out, dict):
+        # common keys to try
+        for k in ("sample", "pred", "out", "x", "eps"):
+            if k in out:
+                v = out[k]
+                break
+        else:
+            v = next(iter(out.values()))
+    else:
+        # diffusers ModelOutput often supports attribute access
+        if hasattr(out, "sample"):
+            v = out.sample
+        elif hasattr(out, "pred"):
+            v = out.pred
+        elif hasattr(out, "x"):
+            v = out.x
+        else:
+            v = out
+
+    # If v is list/tuple (multi-scale), take first tensor
+    if isinstance(v, (list, tuple)):
+        v = v[0]
+
+    return v
+
+
+
 def train(cfg: TrainConfig) -> None:
     seed_everything(cfg.seed)
     ensure_dir(cfg.out_dir)
@@ -149,12 +193,17 @@ def train(cfg: TrainConfig) -> None:
         # ------------------------------------------------------------
         timesteps = timesteps.to(device)
 
-        model_out = transformer(
-            sample=noisy_latents,
-            timestep=timesteps,
-            encoder_hidden_states=enc,
-        )
-        pred = model_out.sample if hasattr(model_out, "sample") else model_out
+        # timesteps for flow-matching: keep as float tensor (B,)
+        # make sure it's on device + dtype consistent
+        t = timesteps.to(noisy_latents.device)
+        # אם timesteps אצלך כבר float/bf16 זה מצוין. אם הוא long — תעשה t = timesteps.float()
+        if t.dtype in (torch.int32, torch.int64):
+            t = t.float()
+        t = t.to(dtype=noisy_latents.dtype)
+
+        pred = _call_zimage_transformer(transformer, noisy_latents, t, enc)
+        pred = pred.to(dtype=noisy_latents.dtype)
+
         pred = pred.to(dtype=noisy_latents.dtype)
 
         diffusion_loss = F.mse_loss(pred.float(), noise.float())
