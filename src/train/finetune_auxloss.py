@@ -150,7 +150,7 @@ def train(cfg: TrainConfig) -> None:
         timesteps = timesteps.to(device)
 
         model_out = transformer(
-            hidden_states=noisy_latents,
+            sample=noisy_latents,
             timestep=timesteps,
             encoder_hidden_states=enc,
         )
