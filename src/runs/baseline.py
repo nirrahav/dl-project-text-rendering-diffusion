@@ -2,8 +2,8 @@ from __future__ import annotations
 
 from pathlib import Path
 from typing import Any, Dict, List, Optional
-
 import json
+
 import torch
 
 from src.pipelines.zimage import load_zimage_turbo
@@ -22,28 +22,22 @@ def generate_baseline(
     height: int = 1024,
     width: int = 1024,
     device: Optional[str] = None,
-    dtype: str = "fp16",
+    dtype: str = "fp16",  # fp16/bf16/fp32
 ) -> Path:
     """
-    Generate baseline images with Z-Image-Turbo and save a run folder:
+    Generate baseline samples and save:
     - images/*.png
     - metadata.json
     - prompts.jsonl (copy)
-    - outputs.jsonl (per-sample records)
-
-    Returns:
-        Path to the created run directory.
+    - outputs.jsonl (per-sample)
     """
     set_seed(seed)
 
     if device is None:
         device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    torch_dtype = {
-        "fp16": torch.float16,
-        "bf16": torch.bfloat16,
-        "fp32": torch.float32,
-    }[dtype]
+    dtype_map = {"fp16": torch.float16, "bf16": torch.bfloat16, "fp32": torch.float32}
+    torch_dtype = dtype_map.get(dtype, torch.float16)
 
     run_name = run_name or f"{timestamp()}_baseline_zimage_turbo"
     run_dir = ensure_dir(Path(out_root) / run_name)

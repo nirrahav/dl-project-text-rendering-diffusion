@@ -1,4 +1,3 @@
-# src/pipelines/zimage.py
 from __future__ import annotations
 from typing import Optional
 
@@ -19,18 +18,15 @@ def load_zimage_turbo(
         device = "cuda" if torch.cuda.is_available() else "cpu"
 
     if torch_dtype is None:
-        if device == "cuda":
-            torch_dtype = torch.float16
-        else:
-            torch_dtype = torch.float32
+        torch_dtype = torch.float16 if device == "cuda" else torch.float32
 
     pipe = ZImagePipeline.from_pretrained(
         model_id,
         torch_dtype=torch_dtype,
         use_safetensors=use_safetensors,
-    )
-    pipe = pipe.to(device)
+    ).to(device)
 
+    # Optional memory optimization
     if device == "cuda":
         try:
             pipe.enable_xformers_memory_efficient_attention()
