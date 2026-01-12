@@ -47,22 +47,23 @@ def _get_components(pipe):
 def _call_zimage_transformer(transformer, noisy_latents, t, enc):
     """
     ZImageTransformer2DModel.forward expects:
-      - x: List[Tensor] (or List[List[Tensor]])
-      - t: time / timestep
-      - cap_feats: List[Tensor] (or List[List[Tensor]])
-
-    We pass a single-scale list: x=[noisy_latents], cap_feats=[enc]
+      - x: List[Tensor] where each Tensor is an image/latent for a single sample
+      - t: time / timestep (typically shape (B,))
+      - cap_feats: List[Tensor] where each Tensor is (seq_len, dim) for a single sample
     """
-    # x and cap_feats must be lists (per signature)
-    x = [noisy_latents]
-    cap_feats = [enc]
+    # noisy_latents: (B, C, H, W)
+    # enc:          (B, S, D)
+    B = noisy_latents.shape[0]
+    assert enc.shape[0] == B, "Batch size mismatch between latents and caption features"
+
+    # split batch into per-sample items
+    x = [noisy_latents[i] for i in range(B)]          # each: (C, H, W)
+    cap_feats = [enc[i] for i in range(B)]            # each: (S, D)
 
     out = transformer(x=x, t=t, cap_feats=cap_feats, return_dict=True)
 
-    # Robustly extract prediction from various return types
-    # Possible shapes: dict-like, object with attrs, tuple/list, etc.
+    # Robustly extract prediction
     if isinstance(out, dict):
-        # common keys to try
         for k in ("sample", "pred", "out", "x", "eps"):
             if k in out:
                 v = out[k]
@@ -70,7 +71,6 @@ def _call_zimage_transformer(transformer, noisy_latents, t, enc):
         else:
             v = next(iter(out.values()))
     else:
-        # diffusers ModelOutput often supports attribute access
         if hasattr(out, "sample"):
             v = out.sample
         elif hasattr(out, "pred"):
@@ -80,12 +80,16 @@ def _call_zimage_transformer(transformer, noisy_latents, t, enc):
         else:
             v = out
 
-    # If v is list/tuple (multi-scale), take first tensor
+    # Z-Image may return a list (per-sample) — stack back to (B, C, H, W)
     if isinstance(v, (list, tuple)):
-        v = v[0]
+        # if each item is (C,H,W), stack
+        if torch.is_tensor(v[0]) and v[0].dim() == 3:
+            v = torch.stack(list(v), dim=0)
+        # if each item is (1,C,H,W), cat
+        elif torch.is_tensor(v[0]) and v[0].dim() == 4:
+            v = torch.cat(list(v), dim=0)
 
     return v
-
 
 
 def train(cfg: TrainConfig) -> None:
