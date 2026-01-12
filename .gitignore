@@ -1,11 +1,10 @@
-# Python
 __pycache__/
 *.pyc
-.ipynb_checkpoints/
-
-# Outputs / runs
-experiments/runs/
-*.png
-
-# OS
+*.pyo
+*.pyd
+.venv/
+.env
 .DS_Store
+outputs/
+checkpoints/
+wandb/
