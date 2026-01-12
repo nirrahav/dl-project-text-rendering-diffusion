@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Optional
 
 import torch
 import torch.nn.functional as F
@@ -44,50 +45,84 @@ def _get_components(pipe):
     return transformer, vae, scheduler, tokenizer, text_encoder
 
 
-def _call_zimage_transformer(transformer, noisy_latents, t, enc):
+def _call_zimage_transformer(transformer, noisy_latents: torch.Tensor, t: torch.Tensor, enc: torch.Tensor) -> torch.Tensor:
     """
-    ZImageTransformer2DModel.forward expects:
-      - x: List[Tensor] where each Tensor is an image/latent for a single sample
-      - t: time / timestep (typically shape (B,))
-      - cap_feats: List[Tensor] where each Tensor is (seq_len, dim) for a single sample
-    """
-    # noisy_latents: (B, C, H, W)
-    # enc:          (B, S, D)
-    B = noisy_latents.shape[0]
-    assert enc.shape[0] == B, "Batch size mismatch between latents and caption features"
+    transformer.forward signature (observed):
+      (x: List[Tensor] or List[List[Tensor]]),
+      t,
+      cap_feats: List[Tensor] or List[List[Tensor]],
+      ...
 
-    # split batch into per-sample items
-    x = [noisy_latents[i].unsqueeze(1) for i in range(B)]  # (C,1,H,W)
-    cap_feats = [enc[i] for i in range(B)]            # each: (S, D)
+    Requirements inferred from transformer code:
+      - each x[i] must be (C, F, H, W)  (expects 4 dims; uses F for frames)
+      - each cap_feats[i] must be (S, D)
+
+    Returns:
+      pred latents tensor of shape (B, C, H, W)
+    """
+    if noisy_latents.dim() != 4:
+        raise RuntimeError(f"Expected noisy_latents (B,C,H,W), got: {tuple(noisy_latents.shape)}")
+    if enc.dim() != 3:
+        raise RuntimeError(f"Expected enc (B,S,D), got: {tuple(enc.shape)}")
+
+    B, C, H, W = noisy_latents.shape
+    if enc.shape[0] != B:
+        raise RuntimeError(f"Batch mismatch: latents B={B} vs enc B={enc.shape[0]}")
+
+    # Each image must be (C,F,H,W). We set F=1.
+    x = [noisy_latents[i].unsqueeze(1) for i in range(B)]  # each: (C,1,H,W)
+
+    # Each caption feature must be (S,D)
+    cap_feats = [enc[i] for i in range(B)]  # each: (S,D)
 
     out = transformer(x=x, t=t, cap_feats=cap_feats, return_dict=True)
 
-    # Robustly extract prediction
-    if isinstance(out, dict):
-        for k in ("sample", "pred", "out", "x", "eps"):
+    # ---- Extract ONLY the latent prediction (not token features) ----
+    v: Optional[object] = None
+
+    if hasattr(out, "sample"):
+        v = out.sample
+    elif hasattr(out, "x"):
+        v = out.x
+    elif hasattr(out, "pred"):
+        v = out.pred
+    elif isinstance(out, dict):
+        for k in ("sample", "x", "pred", "eps"):
             if k in out:
                 v = out[k]
                 break
-        else:
-            v = next(iter(out.values()))
-    else:
-        if hasattr(out, "sample"):
-            v = out.sample
-        elif hasattr(out, "pred"):
-            v = out.pred
-        elif hasattr(out, "x"):
-            v = out.x
-        else:
-            v = out
 
-    # Z-Image may return a list (per-sample) — stack back to (B, C, H, W)
+    if v is None:
+        raise RuntimeError(f"Could not extract latent prediction from transformer output type={type(out)}")
+
+    # If list/tuple per-sample, stack back
     if isinstance(v, (list, tuple)):
-        # if each item is (C,H,W), stack
-        if torch.is_tensor(v[0]) and v[0].dim() == 3:
-            v = torch.stack(list(v), dim=0)
-        # if each item is (1,C,H,W), cat
-        elif torch.is_tensor(v[0]) and v[0].dim() == 4:
-            v = torch.cat(list(v), dim=0)
+        if len(v) != B:
+            raise RuntimeError(f"Expected list output length B={B}, got len={len(v)}")
+        v0 = v[0]
+        if not torch.is_tensor(v0):
+            raise RuntimeError(f"Expected tensor elements in output list, got: {type(v0)}")
+
+        # Elements could be (C,F,H,W) or (C,H,W)
+        if v0.dim() == 4:
+            v = torch.stack(list(v), dim=0)  # (B,C,F,H,W)
+        elif v0.dim() == 3:
+            v = torch.stack(list(v), dim=0)  # (B,C,H,W)
+        else:
+            raise RuntimeError(f"Unexpected output element shape: {tuple(v0.shape)}")
+
+    if not torch.is_tensor(v):
+        raise RuntimeError(f"Expected tensor prediction, got: {type(v)}")
+
+    # If (B,C,F,H,W) with F=1 -> squeeze to (B,C,H,W)
+    if v.dim() == 5 and v.shape[2] == 1:
+        v = v.squeeze(2)
+
+    # Final sanity: must be (B,C,H,W)
+    if v.dim() != 4:
+        raise RuntimeError(f"Transformer prediction has unexpected shape: {tuple(v.shape)}")
+    if v.shape[0] != B:
+        raise RuntimeError(f"Prediction batch mismatch: pred B={v.shape[0]} vs expected B={B}")
 
     return v
 
@@ -97,27 +132,21 @@ def train(cfg: TrainConfig) -> None:
     ensure_dir(cfg.out_dir)
     ensure_dir(cfg.ckpt_dir)
 
-    # --- Load pipeline ---
+    device = torch.device(cfg.device)
+
     pipe = load_zimage(cfg.model_id, dtype=cfg.dtype, device=cfg.device)
     transformer, vae, scheduler, tokenizer, text_encoder = _get_components(pipe)
 
-    # Freeze VAE + text encoder
+    # Freeze VAE + text encoder; fine-tune transformer
     vae.requires_grad_(False)
     text_encoder.requires_grad_(False)
     transformer.train()
 
-    device = torch.device(cfg.device)
-    vae_dtype = next(vae.parameters()).dtype  # fp16 / bf16
+    vae_dtype = next(vae.parameters()).dtype  # fp16/bf16 depending on cfg.dtype
 
-    # Optimizer
     opt = torch.optim.AdamW(transformer.parameters(), lr=cfg.lr)
 
-    # Dataset
-    ds = SynthTextDataset(
-        n=cfg.train_samples,
-        image_size=cfg.image_size,
-        seed=cfg.seed,
-    )
+    ds = SynthTextDataset(n=cfg.train_samples, image_size=cfg.image_size, seed=cfg.seed)
     dl = DataLoader(
         ds,
         batch_size=cfg.batch_size,
@@ -128,131 +157,92 @@ def train(cfg: TrainConfig) -> None:
     )
     dl_iter = iter(dl)
 
-    # Auxiliary loss
     aux_loss_fn = CLIPTextRegionLoss(device=cfg.device)
 
-    # Training loop
     step = 0
     pbar = tqdm(total=cfg.num_steps, desc="train")
 
     while step < cfg.num_steps:
-        # ------------------------------------------------------------
-        # 1) Fetch batch (ALWAYS defined every iteration)
-        # ------------------------------------------------------------
+        # ---- batch ----
         try:
             batch = next(dl_iter)
         except StopIteration:
             dl_iter = iter(dl)
             batch = next(dl_iter)
 
-        pixel_values = batch["pixel_values"].to(device, non_blocking=True)
+        pixel_values = batch["pixel_values"].to(device, non_blocking=True)  # float32
         texts = batch["texts"]
         bboxes = batch["bboxes"].to(device, non_blocking=True)
 
-        # Match dtype with VAE (critical for fp16/bf16)
+        # match dtype for VAE
         pixel_values = pixel_values.to(dtype=vae_dtype)
 
-        # ------------------------------------------------------------
-        # 2) Encode images → latents
-        # ------------------------------------------------------------
+        # ---- encode ----
         with torch.no_grad():
             latents = vae.encode(pixel_values * 2.0 - 1.0).latent_dist.sample()
             latents = latents * vae.config.scaling_factor
 
         latents = latents.to(dtype=vae_dtype)
 
-        # ------------------------------------------------------------
-        # 3) Flow-matching noise + timestep
-        # ------------------------------------------------------------
-        # Flow-matching style noising (scheduler-agnostic)
+        # ---- flow-like noising ----
         noise = torch.randn_like(latents)
-
         bsz = latents.shape[0]
 
-        # sample continuous time / noise level in [0, 1]
-        t = torch.rand((bsz,), device=device, dtype=vae_dtype)  # (B,)
+        # continuous time in [0,1]
+        t = torch.rand((bsz,), device=device, dtype=vae_dtype)
 
-        # create noisy latents: x_t = x + t * ε
+        # x_t = x + t * eps
         noisy_latents = latents + t.view(-1, 1, 1, 1) * noise
         noisy_latents = noisy_latents.to(dtype=vae_dtype)
 
-        # feed "t" as timestep conditioning (many flow-match models accept continuous time)
-        timesteps = t  # keep name for downstream transformer call
-
-        # ------------------------------------------------------------
-        # 4) Text conditioning
-        # ------------------------------------------------------------
+        # ---- text conditioning ----
         with torch.no_grad():
-            text_inputs = tokenizer(
-                texts,
-                padding=True,
-                truncation=True,
-                return_tensors="pt",
-            )
+            text_inputs = tokenizer(texts, padding=True, truncation=True, return_tensors="pt")
             text_inputs = {k: v.to(device) for k, v in text_inputs.items()}
             enc = text_encoder(**text_inputs).last_hidden_state
 
-        # ------------------------------------------------------------
-        # 5) Predict noise / flow
-        # ------------------------------------------------------------
-        timesteps = timesteps.to(device)
+        # Keep dtype consistent
+        enc = enc.to(dtype=noisy_latents.dtype)
 
-        # timesteps for flow-matching: keep as float tensor (B,)
-        # make sure it's on device + dtype consistent
-        t = timesteps.to(noisy_latents.device)
-        # אם timesteps אצלך כבר float/bf16 זה מצוין. אם הוא long — תעשה t = timesteps.float()
-        if t.dtype in (torch.int32, torch.int64):
-            t = t.float()
-        t = t.to(dtype=noisy_latents.dtype)
-
-        pred = _call_zimage_transformer(transformer, noisy_latents, t, enc)
+        # ---- transformer forward (native Z-Image signature) ----
+        pred = _call_zimage_transformer(transformer, noisy_latents, t.to(dtype=noisy_latents.dtype), enc)
         pred = pred.to(dtype=noisy_latents.dtype)
 
-        pred = pred.to(dtype=noisy_latents.dtype)
-
+        # ---- diffusion proxy loss ----
+        # This is a proxy objective: match predicted output to the sampled noise
+        # (shape must match)
+        assert pred.shape == noise.shape, f"pred shape {tuple(pred.shape)} != noise shape {tuple(noise.shape)}"
         diffusion_loss = F.mse_loss(pred.float(), noise.float())
 
-        # ------------------------------------------------------------
-        # 6) Auxiliary loss (FlowMatch-friendly proxy)
-        # ------------------------------------------------------------
-        # No alphas_cumprod in FlowMatch schedulers.
-        # Use a denoised-latent proxy to keep gradients connected.
-        latents_hat = (noisy_latents - pred) / vae.config.scaling_factor
-        latents_hat = latents_hat.to(dtype=vae_dtype)
+        # ---- auxiliary loss (decode proxy denoise) ----
+        latents_hat = (noisy_latents - pred).to(dtype=vae_dtype)
+        latents_hat = latents_hat / vae.config.scaling_factor
 
-        decoded = vae.decode(latents_hat).sample  # [-1, 1]
+        decoded = vae.decode(latents_hat).sample  # [-1,1]
         decoded = (decoded + 1.0) / 2.0
         decoded = decoded.clamp(0, 1)
 
         aux_loss = aux_loss_fn(decoded, bboxes=bboxes, texts=texts)
 
-        # ------------------------------------------------------------
-        # 7) Combined loss + backward
-        # ------------------------------------------------------------
         loss = diffusion_loss + cfg.lambda_aux * aux_loss
         loss = loss / cfg.grad_accum
         loss.backward()
 
         if (step + 1) % cfg.grad_accum == 0:
-            torch.nn.utils.clip_grad_norm_(
-                transformer.parameters(),
-                cfg.max_grad_norm,
-            )
+            torch.nn.utils.clip_grad_norm_(transformer.parameters(), cfg.max_grad_norm)
             opt.step()
             opt.zero_grad(set_to_none=True)
 
-        # Logging
         if step % 25 == 0:
             pbar.set_postfix(
                 {
                     "diff": float(diffusion_loss.detach().cpu()),
                     "aux": float(aux_loss.detach().cpu()),
-                    "lam": cfg.lambda_aux,
+                    "lam": float(cfg.lambda_aux),
                     "dtype": str(vae_dtype).replace("torch.", ""),
                 }
             )
 
-        # Checkpoint
         if step > 0 and step % 200 == 0:
             ckpt_path = Path(cfg.ckpt_dir) / f"transformer_step_{step}.pt"
             torch.save(transformer.state_dict(), ckpt_path)
