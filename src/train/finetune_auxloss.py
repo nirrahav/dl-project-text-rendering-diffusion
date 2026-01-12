@@ -75,18 +75,25 @@ def train(cfg: TrainConfig) -> None:
         except StopIteration:
             dl_iter = iter(dl)
             batch = next(dl_iter)
+            
+            pixel_values = batch["pixel_values"].to(cfg.device)
+            texts = batch["texts"]
+            bboxes = batch["bboxes"].to(cfg.device)
 
-        pixel_values = batch["pixel_values"].to(cfg.device)  # (B,3,H,W) in [0,1]
-        texts = batch["texts"]
-        bboxes = batch["bboxes"].to(cfg.device)
+            # ✅ Make inputs dtype match VAE dtype (fp16/bf16)
+            vae_dtype = next(vae.parameters()).dtype
+            pixel_values = pixel_values.to(dtype=vae_dtype)
 
         # 1) Encode images to latents
         with torch.no_grad():
             latents = vae.encode(pixel_values * 2.0 - 1.0).latent_dist.sample()
             latents = latents * vae.config.scaling_factor
 
+        # ✅ keep everything consistent in dtype
+        latents = latents.to(dtype=vae_dtype)
+
         # 2) Sample timesteps + noise
-        noise = torch.randn_like(latents)
+        noise = torch.randn_like(latents, dtype=latents.dtype)
         bsz = latents.shape[0]
         timesteps = torch.randint(0, scheduler.config.num_train_timesteps, (bsz,), device=latents.device).long()
         noisy_latents = scheduler.add_noise(latents, noise, timesteps)
