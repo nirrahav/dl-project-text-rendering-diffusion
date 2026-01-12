@@ -116,18 +116,20 @@ def train(cfg: TrainConfig) -> None:
         # ------------------------------------------------------------
         # 3) Flow-matching noise + timestep
         # ------------------------------------------------------------
+        # Flow-matching style noising (scheduler-agnostic)
         noise = torch.randn_like(latents)
-        bsz = latents.shape[0]
-        timesteps = torch.randint(
-            0,
-            scheduler.config.num_train_timesteps,
-            (bsz,),
-            device=device,
-            dtype=torch.long,
-        )
 
-        noisy_latents = scheduler.add_noise(latents, noise, timesteps)
+        bsz = latents.shape[0]
+
+        # sample continuous time / noise level in [0, 1]
+        t = torch.rand((bsz,), device=device, dtype=vae_dtype)  # (B,)
+
+        # create noisy latents: x_t = x + t * ε
+        noisy_latents = latents + t.view(-1, 1, 1, 1) * noise
         noisy_latents = noisy_latents.to(dtype=vae_dtype)
+
+        # feed "t" as timestep conditioning (many flow-match models accept continuous time)
+        timesteps = t  # keep name for downstream transformer call
 
         # ------------------------------------------------------------
         # 4) Text conditioning
@@ -145,6 +147,8 @@ def train(cfg: TrainConfig) -> None:
         # ------------------------------------------------------------
         # 5) Predict noise / flow
         # ------------------------------------------------------------
+        timesteps = timesteps.to(device)
+
         model_out = transformer(
             hidden_states=noisy_latents,
             timestep=timesteps,
