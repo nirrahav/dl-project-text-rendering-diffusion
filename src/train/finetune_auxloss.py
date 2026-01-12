@@ -57,7 +57,7 @@ def _call_zimage_transformer(transformer, noisy_latents, t, enc):
     assert enc.shape[0] == B, "Batch size mismatch between latents and caption features"
 
     # split batch into per-sample items
-    x = [noisy_latents[i] for i in range(B)]          # each: (C, H, W)
+    x = [noisy_latents[i].unsqueeze(1) for i in range(B)]  # (C,1,H,W)
     cap_feats = [enc[i] for i in range(B)]            # each: (S, D)
 
     out = transformer(x=x, t=t, cap_feats=cap_feats, return_dict=True)
