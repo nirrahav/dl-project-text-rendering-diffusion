@@ -20,20 +20,18 @@ This project addresses these limitations by introducing an explicit training sig
 
 ## Method Overview
 
-The proposed approach extends the original training objective of Z-Image-Turbo by adding an auxiliary, text-aware loss. The original diffusion loss is kept unchanged, and the auxiliary loss is applied during fine-tuning.
+The proposed approach extends the original training objective of Z-Image-Turbo
+by adding an auxiliary, text-aware loss. The original diffusion loss is kept
+unchanged, and the auxiliary loss is applied during fine-tuning.
 
 The combined objective is defined as:
 
-\[
-\mathcal{L}_{total} = \mathcal{L}_{diffusion} + \lambda \cdot \mathcal{L}_{aux}
-\]
+L_total = L_diffusion + λ · L_aux
 
 Where:
-- **L_diffusion** is the original loss used by the pretrained diffusion model  
-- **L_aux** encourages clarity and consistency of rendered text  
-- **λ** controls the influence of the auxiliary loss  
-
-The auxiliary loss is implemented using a differentiable CLIP-based text–image consistency signal applied to text regions in the generated images.
+- **L_diffusion** is the original diffusion training loss  
+- **L_aux** is the text-aware auxiliary loss  
+- **λ** controls the influence of the auxiliary loss
 
 ---
 
@@ -76,35 +74,6 @@ Observed improvements include:
 - Reduced visual artifacts around letters
 
 All comparisons are performed using identical prompts and inference settings, isolating the effect of the auxiliary loss.
-
----
-
-## Repository Structure
-dl-project-text-rendering-diffusion/
-├── colab/
-│ └── Final_project.ipynb
-├── src/
-│ ├── data/
-│ │ ├── init.py
-│ │ └── synth_text_dataset.py
-│ ├── losses/
-│ │ ├── init.py
-│ │ └── clip_text_region_loss.py
-│ ├── train/
-│ │ ├── init.py
-│ │ └── finetune_auxloss.py
-│ ├── utils/
-│ │ ├── init.py
-│ │ ├── io.py
-│ │ └── seed.py
-│ ├── zimage/
-│ │ ├── init.py
-│ │ └── pipeline_utils.py
-│ ├── init.py
-│ └── config.py
-├── .gitignore
-├── README.md
-└── requirements.txt
 
 ---
 
