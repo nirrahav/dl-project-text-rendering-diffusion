@@ -82,26 +82,26 @@ All comparisons are performed using identical prompts and inference settings, is
 ## Repository Structure
 dl-project-text-rendering-diffusion/
 ├── colab/
-│   └── Final_project.ipynb
+│ └── Final_project.ipynb
 ├── src/
-│   ├── data/
-│   │   ├── __init__.py
-│   │   └── synth_text_dataset.py
-│   ├── losses/
-│   │   ├── __init__.py
-│   │   └── clip_text_region_loss.py
-│   ├── train/
-│   │   ├── __init__.py
-│   │   └── finetune_auxloss.py
-│   ├── utils/
-│   │   ├── __init__.py
-│   │   ├── io.py
-│   │   └── seed.py
-│   ├── zimage/
-│   │   ├── __init__.py
-│   │   └── pipeline_utils.py
-│   ├── __init__.py
-│   └── config.py
+│ ├── data/
+│ │ ├── init.py
+│ │ └── synth_text_dataset.py
+│ ├── losses/
+│ │ ├── init.py
+│ │ └── clip_text_region_loss.py
+│ ├── train/
+│ │ ├── init.py
+│ │ └── finetune_auxloss.py
+│ ├── utils/
+│ │ ├── init.py
+│ │ ├── io.py
+│ │ └── seed.py
+│ ├── zimage/
+│ │ ├── init.py
+│ │ └── pipeline_utils.py
+│ ├── init.py
+│ └── config.py
 ├── .gitignore
 ├── README.md
 └── requirements.txt
