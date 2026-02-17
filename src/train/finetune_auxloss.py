@@ -172,52 +172,55 @@ def _sample_sigma_and_noisy_latents(pipe: ZImagePipeline, latents: torch.Tensor)
 
 def forward_generate_decoded_images(pipe: ZImagePipeline, texts: List[str], image_size: int) -> torch.Tensor:
     """
-    Differentiable forward for Z-Image-Turbo (your version):
-      - transformer expects x as list of (C,F,H,W) where C=16, F=1
-      - patch_size fixed at 2, f_patch_size fixed at 1
-      - vae expects latent_channels=16, so we can decode directly.
+    Differentiable forward for Z-Image-Turbo:
+    Returns decoded images in [0,1], shape (B,3,image_size,image_size)
 
-    Returns:
-      decoded images in [0,1], shape (B,3,image_size,image_size)
+    FIX:
+    - If transformer weights are FP32 (recommended for GradScaler),
+      we must NOT feed FP16 x into transformer, because internal pad token is FP32.
+      So we temporarily DISABLE autocast around transformer forward.
     """
     device = next(pipe.transformer.parameters()).device
-    # NOTE: transformer is kept in FP32 in the recommended fix.
-    # AMP autocast (fp16/bf16) is handled outside this function.
-    transformer_dtype = next(pipe.transformer.parameters()).dtype
-
+    transformer_dtype = next(pipe.transformer.parameters()).dtype  # expected fp32 in recommended setup
     B = len(texts)
 
     # ---- encode text -> cap_feats list length B, each (seq, dim) ----
     cap_feats = _encode_cap_feats(pipe, texts, device=device, target_dtype=transformer_dtype)
 
-    # ---- sample latents with correct channel count (C=16) ----
-    in_ch = int(getattr(pipe.transformer.config, "in_channels", 16))  # confirmed 16
+    # ---- sample latents (C=16) ----
+    in_ch = int(getattr(pipe.transformer.config, "in_channels", 16))
     latent_h = image_size // getattr(pipe, "vae_scale_factor", 8)
     latent_w = image_size // getattr(pipe, "vae_scale_factor", 8)
 
-    # Keep latents in transformer dtype (fp32). autocast will cast ops where appropriate.
+    # Create latents explicitly in transformer dtype (fp32)
     latents = torch.randn((B, in_ch, latent_h, latent_w), device=device, dtype=transformer_dtype)
 
-    # ---- add sigma noise ----
+    # ---- add sigma noise (keep dtype consistent) ----
     noisy_latents, sigma = _sample_sigma_and_noisy_latents(pipe, latents)  # (B,16,h,w), (B,)
 
-    # ---- transformer expects (C,F,H,W). For static image, F=1 ----
+    # ---- transformer expects (C,F,H,W), F=1 ----
     noisy_latents = noisy_latents.unsqueeze(2)  # (B,16,1,h,w)
-    x_list = [noisy_latents[i] for i in range(B)]  # list length B, each (16,1,h,w)
 
-    # ---- forward transformer ----
-    out = pipe.transformer(
-        x=x_list,
-        t=sigma,               # (B,)
-        cap_feats=cap_feats,   # list length B
-        return_dict=True,
-        patch_size=2,
-        f_patch_size=1,
-    )
+    # IMPORTANT: ensure x tensors are FP32 if transformer is FP32
+    if transformer_dtype == torch.float32 and noisy_latents.dtype != torch.float32:
+        noisy_latents = noisy_latents.float()
+    x_list = [noisy_latents[i] for i in range(B)]
+
+    # ---- forward transformer (DISABLE autocast here to avoid fp16 x vs fp32 pad token) ----
+    from torch.amp import autocast
+    with autocast(device_type="cuda", enabled=False):
+        out = pipe.transformer(
+            x=x_list,
+            t=sigma.to(dtype=torch.float32),  # keep time/sigma consistent with fp32 path
+            cap_feats=cap_feats,
+            return_dict=True,
+            patch_size=2,
+            f_patch_size=1,
+        )
 
     pred = out.sample if hasattr(out, "sample") else out
 
-    # pred usually list length B of (16,1,h,w). Stack -> (B,16,1,h,w)
+    # pred: list length B of (16,1,h,w) OR tensor
     if isinstance(pred, (list, tuple)):
         pred_latents = torch.stack(pred, dim=0)
     else:
@@ -227,7 +230,7 @@ def forward_generate_decoded_images(pipe: ZImagePipeline, texts: List[str], imag
     if pred_latents.dim() == 5:
         pred_latents = pred_latents[:, :, 0]
 
-    # ---- VAE decode ----
+    # ---- VAE decode (can run under outer autocast; dtype is fine) ----
     sf = getattr(getattr(pipe.vae, "config", None), "scaling_factor", 1.0)
     decoded_raw = pipe.vae.decode(pred_latents / sf).sample
     decoded = torch.sigmoid(decoded_raw / 4.0)
