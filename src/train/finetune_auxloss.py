@@ -218,11 +218,8 @@ def forward_generate_decoded_images(pipe: ZImagePipeline, texts: List[str], imag
 
     # ---- VAE decode ----
     sf = getattr(getattr(pipe.vae, "config", None), "scaling_factor", 1.0)
-    decoded_raw = pipe.vae.decode(pred_latents / sf).sample  # unbounded / roughly [-?, ?]
-
-    # ✅ Differentiable squashing to [0,1] (keeps gradients alive)
-    decoded = torch.sigmoid(decoded_raw)
-
+    decoded_raw = pipe.vae.decode(pred_latents / sf).sample
+    decoded = torch.sigmoid(decoded_raw / 4.0)   # נסה 4.0 (אם עדיין רווי, הגדל ל-8.0)
     return decoded
 
 
