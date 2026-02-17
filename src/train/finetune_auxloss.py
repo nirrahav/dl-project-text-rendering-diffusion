@@ -18,6 +18,10 @@ from src.config import TrainConfig
 # UPDATE THIS IMPORT PATH to where you saved SynthTextDataset
 from src.data.synth_text_dataset import SynthTextDataset, collate_fn
 
+SANITY_MODE = False   # True = verify optimizer updates weights, False = real CLIP aux training
+LOG_EVERY = 25        # print every N optimizer steps
+DEBUG_SHAPES_ONCE = False  # set True for one run if still failing
+
 
 # ----------------------------
 # dtype helper
