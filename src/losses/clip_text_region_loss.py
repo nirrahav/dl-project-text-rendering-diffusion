@@ -53,7 +53,16 @@ class CLIPTextRegionLoss(torch.nn.Module):
         std  = torch.tensor([0.26862954, 0.26130258, 0.27577711], device=crops.device, dtype=clip_dtype).view(1, 3, 1, 1)
         crops_norm = (crops - mean) / std
 
-        img_feat = self.clip.get_image_features(pixel_values=crops_norm)
+        img_out = self.clip.get_image_features(pixel_values=crops_norm)
+
+        # HF version compatibility: sometimes returns tensor, sometimes a model output
+        if hasattr(img_out, "pooler_output"):
+            img_feat = img_out.pooler_output
+        elif hasattr(img_out, "image_embeds"):
+            img_feat = img_out.image_embeds
+        else:
+            img_feat = img_out  # already a tensor in some versions
+
         img_feat = F.normalize(img_feat, dim=-1)
 
         txt_feat = self._encode_text(texts).to(dtype=img_feat.dtype)
