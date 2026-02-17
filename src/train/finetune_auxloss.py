@@ -2,25 +2,22 @@ from __future__ import annotations
 
 import os
 import gc
-import math
 import random
-from typing import Any, Dict, List, Tuple
+from typing import Dict, List
 
 import torch
-import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
 from diffusers import ZImagePipeline
 
 from src.losses.clip_text_region_loss import CLIPTextRegionLoss
 from src.config import TrainConfig
-
-# UPDATE THIS IMPORT PATH to where you saved SynthTextDataset
 from src.data.synth_text_dataset import SynthTextDataset, collate_fn
 
 SANITY_MODE = False   # True = verify optimizer updates weights, False = real CLIP aux training
 LOG_EVERY = 25        # print every N optimizer steps
 DEBUG_SHAPES_ONCE = False  # set True for one run if still failing
+
 
 # ----------------------------
 # dtype helper
@@ -87,10 +84,19 @@ def _build_loader(cfg: TrainConfig) -> DataLoader:
 #   forward(x: list[Tensor,...], t, cap_feats: list[Tensor,...], ...)
 # ============================================================
 
-def _encode_cap_feats(pipe: ZImagePipeline, texts: List[str], device: str) -> List[torch.Tensor]:
+def _encode_cap_feats(
+    pipe: ZImagePipeline,
+    texts: List[str],
+    device: str,
+    target_dtype: torch.dtype,
+) -> List[torch.Tensor]:
     """
     Must return: list length B, each tensor is 2D (seq_len, hidden_dim).
     This is REQUIRED for transformer_z_image._pad_with_ids which does repeat(pad_len, 1).
+
+    IMPORTANT FIX:
+    If the pipeline was loaded with fp16 but we train transformer in fp32,
+    cast cap_feats to transformer dtype (fp32) to avoid dtype mismatch.
     """
     tok = pipe.tokenizer(
         texts,
@@ -109,10 +115,13 @@ def _encode_cap_feats(pipe: ZImagePipeline, texts: List[str], device: str) -> Li
     if cap.dim() != 3:
         raise RuntimeError(f"Unexpected cap shape from text encoder: {tuple(cap.shape)}")
 
+    # Cast to transformer dtype (usually fp32 if using scaler)
+    cap = cap.to(dtype=target_dtype)
+
     cap_list: List[torch.Tensor] = []
     B = cap.shape[0]
     for i in range(B):
-        c = cap[i]  # should be (seq, dim)
+        c = cap[i]  # (seq, dim)
 
         # Clean up any weird singleton dims
         while c.dim() > 2 and c.shape[0] == 1:
@@ -120,7 +129,6 @@ def _encode_cap_feats(pipe: ZImagePipeline, texts: List[str], device: str) -> Li
         if c.dim() == 3 and c.shape[1] == 1:
             c = c.squeeze(1)
         if c.dim() > 2:
-            # last resort: flatten all but seq
             c = c.reshape(c.shape[0], -1)
 
         if c.dim() != 2:
@@ -166,25 +174,29 @@ def forward_generate_decoded_images(pipe: ZImagePipeline, texts: List[str], imag
     """
     Differentiable forward for Z-Image-Turbo (your version):
       - transformer expects x as list of (C,F,H,W) where C=16, F=1
-      - patch_size fixed at 2, f_patch_size fixed at 1 (per all_patch_size/all_f_patch_size)
+      - patch_size fixed at 2, f_patch_size fixed at 1
       - vae expects latent_channels=16, so we can decode directly.
 
     Returns:
       decoded images in [0,1], shape (B,3,image_size,image_size)
     """
     device = next(pipe.transformer.parameters()).device
-    dtype = next(pipe.transformer.parameters()).dtype
+    # NOTE: transformer is kept in FP32 in the recommended fix.
+    # AMP autocast (fp16/bf16) is handled outside this function.
+    transformer_dtype = next(pipe.transformer.parameters()).dtype
+
     B = len(texts)
 
     # ---- encode text -> cap_feats list length B, each (seq, dim) ----
-    cap_feats = _encode_cap_feats(pipe, texts, device=device)  # IMPORTANT: each item must be 2D
+    cap_feats = _encode_cap_feats(pipe, texts, device=device, target_dtype=transformer_dtype)
 
     # ---- sample latents with correct channel count (C=16) ----
     in_ch = int(getattr(pipe.transformer.config, "in_channels", 16))  # confirmed 16
-    latent_h = image_size // getattr(pipe, "vae_scale_factor", 8)     # confirmed 8 -> 64 when image_size=512
+    latent_h = image_size // getattr(pipe, "vae_scale_factor", 8)
     latent_w = image_size // getattr(pipe, "vae_scale_factor", 8)
 
-    latents = torch.randn((B, in_ch, latent_h, latent_w), device=device, dtype=dtype)
+    # Keep latents in transformer dtype (fp32). autocast will cast ops where appropriate.
+    latents = torch.randn((B, in_ch, latent_h, latent_w), device=device, dtype=transformer_dtype)
 
     # ---- add sigma noise ----
     noisy_latents, sigma = _sample_sigma_and_noisy_latents(pipe, latents)  # (B,16,h,w), (B,)
@@ -199,8 +211,8 @@ def forward_generate_decoded_images(pipe: ZImagePipeline, texts: List[str], imag
         t=sigma,               # (B,)
         cap_feats=cap_feats,   # list length B
         return_dict=True,
-        patch_size=2,          # only supported value
-        f_patch_size=1,        # only supported value
+        patch_size=2,
+        f_patch_size=1,
     )
 
     pred = out.sample if hasattr(out, "sample") else out
@@ -218,9 +230,8 @@ def forward_generate_decoded_images(pipe: ZImagePipeline, texts: List[str], imag
     # ---- VAE decode ----
     sf = getattr(getattr(pipe.vae, "config", None), "scaling_factor", 1.0)
     decoded_raw = pipe.vae.decode(pred_latents / sf).sample
-    decoded = torch.sigmoid(decoded_raw / 4.0)   # נסה 4.0 (אם עדיין רווי, הגדל ל-8.0)
+    decoded = torch.sigmoid(decoded_raw / 4.0)
     return decoded
-
 
 
 # ============================================================
@@ -236,6 +247,18 @@ def train(cfg: TrainConfig) -> None:
 
     # ---- build ----
     pipe = _build_pipe(cfg, device=device)
+
+    # ---- freeze non-train parts (recommended) ----
+    for p in pipe.vae.parameters():
+        p.requires_grad_(False)
+    for p in pipe.text_encoder.parameters():
+        p.requires_grad_(False)
+
+    # ---- IMPORTANT FIX (recommended): keep trainable weights FP32 when using GradScaler ----
+    amp_dtype = _resolve_dtype(cfg.dtype)  # this is the autocast dtype (fp16/bf16/fp32)
+    if device == "cuda" and amp_dtype == torch.float16:
+        pipe.transformer.to(torch.float32)
+
     model = pipe.transformer
     model.train()
 
@@ -243,9 +266,8 @@ def train(cfg: TrainConfig) -> None:
     optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.lr)
 
     # ---- AMP setup (PyTorch 2.6+ safe) ----
-    dtype = _resolve_dtype(cfg.dtype)
-    use_amp = (device == "cuda") and (dtype in (torch.float16, torch.bfloat16))
-    use_scaler = (device == "cuda") and (dtype == torch.float16)
+    use_amp = (device == "cuda") and (amp_dtype in (torch.float16, torch.bfloat16))
+    use_scaler = (device == "cuda") and (amp_dtype == torch.float16)
 
     from torch.amp import autocast, GradScaler
     scaler = GradScaler(enabled=use_scaler)
@@ -275,15 +297,15 @@ def train(cfg: TrainConfig) -> None:
         texts: List[str] = batch["texts"]
 
         # ---- forward ----
-        # compute aux loss every aux_every micro-steps; otherwise do 0*param.sum() so backward won't crash
         if (micro_step % cfg.aux_every) == 0:
-            decoded = forward_generate_decoded_images(pipe, texts=texts, image_size=cfg.image_size)
-
-            with autocast(device_type="cuda", enabled=use_amp, dtype=dtype):
+            # Put the FULL forward (including transformer+vae decode) inside autocast
+            # so compute is fp16/bf16 while weights remain fp32 (recommended).
+            with autocast(device_type="cuda", enabled=use_amp, dtype=amp_dtype):
+                decoded = forward_generate_decoded_images(pipe, texts=texts, image_size=cfg.image_size)
                 aux = aux_loss_fn(decoded, bboxes=bboxes, texts=texts)
                 loss = (cfg.lambda_aux * aux) / cfg.grad_accum
         else:
-            # ✅ "zero" but connected to graph
+            # "zero" but connected to graph
             loss = (probe_param.sum() * 0.0) / cfg.grad_accum
 
         # ---- backward ----
@@ -299,6 +321,7 @@ def train(cfg: TrainConfig) -> None:
             before = probe_param.detach().float().clone()
 
             if scaler.is_enabled():
+                # This will now work because grads are NOT fp16 (weights are fp32)
                 scaler.unscale_(optimizer)
 
             grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.max_grad_norm)
@@ -315,9 +338,9 @@ def train(cfg: TrainConfig) -> None:
             after = probe_param.detach().float()
             delta_w = (after - before).abs().mean().item()
 
-            # If your TrainConfig doesn't have log_every, just hardcode:
             log_every = getattr(cfg, "log_every", 20)
             if global_step <= 3 or (global_step % log_every == 0):
+                # Note: loss here is already divided by grad_accum; multiply back for readable logging
                 print(
                     f"[step {global_step}/{cfg.num_steps}] "
                     f"loss={float(loss.detach().cpu().item() * cfg.grad_accum):.6f} "
