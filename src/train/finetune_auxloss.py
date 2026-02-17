@@ -82,6 +82,111 @@ def _build_loaders(cfg: TrainConfig) -> DataLoader:
     )
     return dl
 
+import torch
+import torch.nn.functional as F
+
+def _encode_cap_feats(pipe, texts: list[str], device: str):
+    """
+    Build cap_feats for ZImageTransformer2DModel using Qwen3 text encoder.
+    Returns a structure compatible with: cap_feats: list[Tensor, list[list[Tensor]]]
+    """
+    tok = pipe.tokenizer(
+        texts,
+        padding=True,
+        truncation=True,
+        return_tensors="pt",
+    )
+    tok = {k: v.to(device) for k, v in tok.items()}
+
+    # Qwen3Model output usually has .last_hidden_state
+    out = pipe.text_encoder(**tok)
+    cap = getattr(out, "last_hidden_state", out[0])
+
+    # The transformer expects a "list[Tensor | nested lists]".
+    # Most stable simplest: one-level list with a single Tensor.
+    return [cap]
+
+
+def _sample_sigma_and_noisy_latents(pipe, latents: torch.Tensor):
+    """
+    FlowMatchEulerDiscreteScheduler is sigma-based. We'll sample a sigma and add noise.
+    Returns: noisy_latents, sigma_tensor
+    """
+    device = latents.device
+    dtype = latents.dtype
+
+    # Ensure scheduler has sigmas; if not, try set_timesteps to populate.
+    if not hasattr(pipe.scheduler, "sigmas") or pipe.scheduler.sigmas is None:
+        # Fallback: populate timesteps/sigmas
+        nT = getattr(getattr(pipe.scheduler, "config", None), "num_train_timesteps", 1000)
+        pipe.scheduler.set_timesteps(nT, device=device)
+
+    sigmas = pipe.scheduler.sigmas.to(device=device)
+
+    # sample an index in [0, len(sigmas)-1]
+    idx = torch.randint(low=0, high=sigmas.shape[0], size=(latents.shape[0],), device=device)
+    sigma = sigmas[idx].to(dtype=dtype)  # (B,)
+
+    noise = torch.randn_like(latents)
+    # broadcast sigma -> (B,1,1,1)
+    sigma_b = sigma.view(-1, 1, 1, 1)
+    noisy = latents + noise * sigma_b
+
+    return noisy, sigma
+
+
+def forward_generate_decoded_images(pipe, texts: list[str], image_size: int) -> torch.Tensor:
+    """
+    Differentiable forward:
+    text -> cap_feats -> noisy latents -> transformer -> predicted latents -> VAE decode -> [0,1] image
+    """
+    device = next(pipe.transformer.parameters()).device
+    dtype = next(pipe.transformer.parameters()).dtype
+    B = len(texts)
+
+    cap_feats = _encode_cap_feats(pipe, texts, device=device)
+
+    # Latent shape: (B,4,H/8,W/8) is standard for AutoencoderKL
+    latent_h = image_size // 8
+    latent_w = image_size // 8
+    latents = torch.randn((B, 4, latent_h, latent_w), device=device, dtype=dtype)
+
+    noisy_latents, sigma = _sample_sigma_and_noisy_latents(pipe, latents)
+
+    # IMPORTANT: transformer signature:
+    # forward(x: list[Tensor,...], t, cap_feats: list[Tensor,...], ...)
+    x_in = [noisy_latents]      # minimal valid structure
+    t_in = sigma                # (B,) sigma values
+
+    out = pipe.transformer(
+        x=x_in,
+        t=t_in,
+        cap_feats=cap_feats,
+        return_dict=True,
+    )
+
+    # Robustly extract prediction:
+    # Some diffusers models return .sample, others return dict-like with "sample",
+    # and some return list/tuple.
+    if hasattr(out, "sample"):
+        pred = out.sample
+    elif isinstance(out, dict) and "sample" in out:
+        pred = out["sample"]
+    else:
+        pred = out
+
+    # pred might be a list (matching x structure). Take first tensor.
+    if isinstance(pred, (list, tuple)):
+        pred_latents = pred[0]
+    else:
+        pred_latents = pred
+
+    # Decode to image
+    sf = getattr(getattr(pipe.vae, "config", None), "scaling_factor", 0.18215)
+    decoded = pipe.vae.decode(pred_latents / sf).sample  # typically in [-1,1]
+    decoded = (decoded.clamp(-1, 1) + 1) / 2             # -> [0,1]
+    return decoded
+
 
 def train(cfg: TrainConfig) -> None:
     device = cfg.device if torch.cuda.is_available() else "cpu"
@@ -157,9 +262,10 @@ def train(cfg: TrainConfig) -> None:
             # REAL mode: you must produce decoded images from the model in a differentiable way.
             # If you paste the original forward from your previous training code,
             # I will replace this block with the correct implementation.
-            raise NotImplementedError(
-                "cfg.sanity_mode=False requires a differentiable forward that generates decoded images."
-            )
+            decoded = forward_generate_decoded_images(pipe, texts=texts, image_size=cfg.image_size)
+            with torch.cuda.amp.autocast(enabled=use_amp):
+                aux_loss = aux_loss_fn(decoded, bboxes=bboxes, texts=texts)
+                loss = (cfg.lambda_aux * aux_loss) / cfg.grad_accum
 
         # ----------------------------
         # Backward (AMP-safe)
