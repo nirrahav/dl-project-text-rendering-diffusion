@@ -133,12 +133,22 @@ def _encode_cap_feats(pipe: ZImagePipeline, texts: List[str], device: str) -> Li
 
 
 def _ensure_scheduler_sigmas(pipe: ZImagePipeline, device: str) -> None:
+    """
+    FlowMatchEulerDiscreteScheduler is sigma-based. Make sure .sigmas exists.
+    """
     if not hasattr(pipe.scheduler, "sigmas") or pipe.scheduler.sigmas is None:
         nT = getattr(getattr(pipe.scheduler, "config", None), "num_train_timesteps", 1000)
         pipe.scheduler.set_timesteps(nT, device=device)
 
 
 def _sample_sigma_and_noisy_latents(pipe: ZImagePipeline, latents: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Sample a sigma from scheduler.sigmas and add noise:
+      noisy = latents + sigma * eps
+    Returns:
+      noisy_latents: same shape as latents
+      sigma: (B,) sigma values
+    """
     device = latents.device
     dtype = latents.dtype
 
@@ -148,55 +158,73 @@ def _sample_sigma_and_noisy_latents(pipe: ZImagePipeline, latents: torch.Tensor)
     idx = torch.randint(low=0, high=sigmas.shape[0], size=(latents.shape[0],), device=device)
     sigma = sigmas[idx].to(dtype=dtype)  # (B,)
 
-    noise = torch.randn_like(latents)
-    noisy = latents + noise * sigma.view(-1, 1, 1, 1)
+    eps = torch.randn_like(latents)
+    noisy = latents + eps * sigma.view(-1, 1, 1, 1)
     return noisy, sigma
 
 
 def forward_generate_decoded_images(pipe: ZImagePipeline, texts: List[str], image_size: int) -> torch.Tensor:
+    """
+    Differentiable forward for Z-Image-Turbo (your version):
+      - transformer expects x as list of (C,F,H,W) where C=16, F=1
+      - patch_size fixed at 2, f_patch_size fixed at 1 (per all_patch_size/all_f_patch_size)
+      - vae expects latent_channels=16, so we can decode directly.
+
+    Returns:
+      decoded images in [0,1], shape (B,3,image_size,image_size)
+    """
     device = next(pipe.transformer.parameters()).device
     dtype = next(pipe.transformer.parameters()).dtype
     B = len(texts)
 
-    cap_feats = _encode_cap_feats(pipe, texts, device=device)  # list length B, each (seq, dim)
+    # ---- encode text -> cap_feats list length B, each (seq, dim) ----
+    cap_feats = _encode_cap_feats(pipe, texts, device=device)  # IMPORTANT: each item must be 2D
 
-    latent_h = image_size // 8
-    latent_w = image_size // 8
-    latents = torch.randn((B, 4, latent_h, latent_w), device=device, dtype=dtype)
+    # ---- sample latents with correct channel count (C=16) ----
+    in_ch = int(getattr(pipe.transformer.config, "in_channels", 16))  # confirmed 16
+    latent_h = image_size // getattr(pipe, "vae_scale_factor", 8)     # confirmed 8 -> 64 when image_size=512
+    latent_w = image_size // getattr(pipe, "vae_scale_factor", 8)
 
-    noisy_latents, sigma = _sample_sigma_and_noisy_latents(pipe, latents)  # (B,4,h,w), (B,)
+    latents = torch.randn((B, in_ch, latent_h, latent_w), device=device, dtype=dtype)
 
-    # ✅ Z-Image expects (C,F,H,W). For static image, set F=1
-    noisy_latents = noisy_latents.unsqueeze(2)  # (B,4,1,h,w)
+    # ---- add sigma noise ----
+    noisy_latents, sigma = _sample_sigma_and_noisy_latents(pipe, latents)  # (B,16,h,w), (B,)
 
-    # ✅ transformer expects list length B, each item (C,F,H,W)
-    x_list = [noisy_latents[i] for i in range(B)]  # each (4,1,h,w)
+    # ---- transformer expects (C,F,H,W). For static image, F=1 ----
+    noisy_latents = noisy_latents.unsqueeze(2)  # (B,16,1,h,w)
+    x_list = [noisy_latents[i] for i in range(B)]  # list length B, each (16,1,h,w)
 
+    # ---- forward transformer ----
     out = pipe.transformer(
         x=x_list,
-        t=sigma,
-        cap_feats=cap_feats,
+        t=sigma,               # (B,)
+        cap_feats=cap_feats,   # list length B
         return_dict=True,
-        patch_size=4,
-        f_patch_size=1,
+        patch_size=2,          # only supported value
+        f_patch_size=1,        # only supported value
     )
 
     pred = out.sample if hasattr(out, "sample") else out
 
-    # pred is usually list length B of (C,F,H,W). stack -> (B,C,F,H,W)
+    # pred usually list length B of (16,1,h,w). Stack -> (B,16,1,h,w)
     if isinstance(pred, (list, tuple)):
         pred_latents = torch.stack(pred, dim=0)
     else:
         pred_latents = pred
 
-    # ✅ VAE expects (B,4,H,W) so drop F dimension
+    # Drop F dimension -> (B,16,h,w)
     if pred_latents.dim() == 5:
-        pred_latents = pred_latents[:, :, 0]  # take frame 0 => (B,4,h,w)
+        pred_latents = pred_latents[:, :, 0]
 
-    sf = getattr(getattr(pipe.vae, "config", None), "scaling_factor", 0.18215)
-    decoded = pipe.vae.decode(pred_latents / sf).sample  # [-1,1]
-    decoded = (decoded.clamp(-1, 1) + 1) / 2             # [0,1]
+    # ---- VAE decode ----
+    sf = getattr(getattr(pipe.vae, "config", None), "scaling_factor", 1.0)
+    decoded_raw = pipe.vae.decode(pred_latents / sf).sample  # unbounded / roughly [-?, ?]
+
+    # ✅ Differentiable squashing to [0,1] (keeps gradients alive)
+    decoded = torch.sigmoid(decoded_raw)
+
     return decoded
+
 
 
 # ============================================================
