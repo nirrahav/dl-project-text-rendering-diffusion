@@ -216,7 +216,7 @@ def forward_generate_decoded_images(pipe: ZImagePipeline, texts: List[str], imag
     if pred_latents.dim() == 5:
         pred_latents = pred_latents[:, :, 0]
 
-    # ---- VAE decode ----16 channels, so we can decode directly without extra conv layers
+    # ---- VAE decode ----
     sf = getattr(getattr(pipe.vae, "config", None), "scaling_factor", 1.0)
     decoded_raw = pipe.vae.decode(pred_latents / sf).sample  # unbounded / roughly [-?, ?]
 
