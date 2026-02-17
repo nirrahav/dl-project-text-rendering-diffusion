@@ -95,11 +95,32 @@ def _encode_cap_feats(pipe: ZImagePipeline, texts: List[str], device: str):
     tok = {k: v.to(device) for k, v in tok.items()}
 
     out = pipe.text_encoder(**tok)
-    cap = getattr(out, "last_hidden_state", out[0])  # (B, seq, dim)
+    cap = getattr(out, "last_hidden_state", out[0])  # usually (B, seq, dim)
 
-    # ✅ transformer expects list length B, each item is (seq, dim)
-    cap_list = [cap[i] for i in range(cap.shape[0])]
+    cap_list: List[torch.Tensor] = []
+    for i in range(cap.shape[0]):
+        c = cap[i]  # expected (seq, dim) but sometimes comes with extra dims
+
+        # ✅ squeeze leading singleton dims until <=2D
+        while c.dim() > 2 and c.shape[0] == 1:
+            c = c.squeeze(0)
+
+        # ✅ if still 3D (e.g., seq x 1 x dim), squeeze the middle singleton
+        if c.dim() == 3 and c.shape[1] == 1:
+            c = c.squeeze(1)
+
+        # ✅ last resort: flatten everything except sequence dimension
+        if c.dim() > 2:
+            c = c.reshape(c.shape[0], -1)
+
+        # at this point must be (seq, dim)
+        if c.dim() != 2:
+            raise RuntimeError(f"cap_feat must be 2D (seq, dim). got shape={tuple(c.shape)}")
+
+        cap_list.append(c)
+
     return cap_list
+
 
 
 def _sample_sigma_and_noisy_latents(pipe, latents: torch.Tensor):
