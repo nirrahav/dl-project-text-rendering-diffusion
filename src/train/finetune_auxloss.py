@@ -177,6 +177,8 @@ def forward_generate_decoded_images(pipe: ZImagePipeline, texts: List[str], imag
         t=sigma,
         cap_feats=cap_feats,
         return_dict=True,
+        patch_size=4,
+        f_patch_size=1,
     )
 
     pred = out.sample if hasattr(out, "sample") else out
