@@ -39,9 +39,6 @@ def _seed_all(seed: int) -> None:
     torch.cuda.manual_seed_all(seed)
 
 
-# ----------------------------
-# sanity helpers
-# ----------------------------
 def _pick_probe_param(module: torch.nn.Module) -> torch.nn.Parameter:
     for p in module.parameters():
         if p.requires_grad:
@@ -69,9 +66,9 @@ def _build_pipe(cfg: TrainConfig, device: str) -> ZImagePipeline:
     return pipe
 
 
-def _build_loaders(cfg: TrainConfig) -> DataLoader:
+def _build_loader(cfg: TrainConfig) -> DataLoader:
     ds = SynthTextDataset(n=cfg.train_samples, image_size=cfg.image_size, seed=cfg.seed)
-    dl = DataLoader(
+    return DataLoader(
         ds,
         batch_size=cfg.batch_size,
         shuffle=True,
@@ -80,12 +77,18 @@ def _build_loaders(cfg: TrainConfig) -> DataLoader:
         drop_last=True,
         collate_fn=collate_fn,
     )
-    return dl
 
-import torch
-import torch.nn.functional as F
 
-def _encode_cap_feats(pipe: ZImagePipeline, texts: List[str], device: str):
+# ============================================================
+# Z-Image differentiable forward (matches your transformer signature)
+#   forward(x: list[Tensor,...], t, cap_feats: list[Tensor,...], ...)
+# ============================================================
+
+def _encode_cap_feats(pipe: ZImagePipeline, texts: List[str], device: str) -> List[torch.Tensor]:
+    """
+    Must return: list length B, each tensor is 2D (seq_len, hidden_dim).
+    This is REQUIRED for transformer_z_image._pad_with_ids which does repeat(pad_len, 1).
+    """
     tok = pipe.tokenizer(
         texts,
         padding=True,
@@ -95,25 +98,28 @@ def _encode_cap_feats(pipe: ZImagePipeline, texts: List[str], device: str):
     tok = {k: v.to(device) for k, v in tok.items()}
 
     out = pipe.text_encoder(**tok)
-    cap = getattr(out, "last_hidden_state", out[0])  # usually (B, seq, dim)
+    cap = getattr(out, "last_hidden_state", out[0])  # expected (B, seq, dim)
+
+    # Ensure we have (B, seq, dim)
+    if cap.dim() == 4 and cap.shape[1] == 1:
+        cap = cap.squeeze(1)  # (B, seq, dim)
+    if cap.dim() != 3:
+        raise RuntimeError(f"Unexpected cap shape from text encoder: {tuple(cap.shape)}")
 
     cap_list: List[torch.Tensor] = []
-    for i in range(cap.shape[0]):
-        c = cap[i]  # expected (seq, dim) but sometimes comes with extra dims
+    B = cap.shape[0]
+    for i in range(B):
+        c = cap[i]  # should be (seq, dim)
 
-        # ✅ squeeze leading singleton dims until <=2D
+        # Clean up any weird singleton dims
         while c.dim() > 2 and c.shape[0] == 1:
             c = c.squeeze(0)
-
-        # ✅ if still 3D (e.g., seq x 1 x dim), squeeze the middle singleton
         if c.dim() == 3 and c.shape[1] == 1:
             c = c.squeeze(1)
-
-        # ✅ last resort: flatten everything except sequence dimension
         if c.dim() > 2:
+            # last resort: flatten all but seq
             c = c.reshape(c.shape[0], -1)
 
-        # at this point must be (seq, dim)
         if c.dim() != 2:
             raise RuntimeError(f"cap_feat must be 2D (seq, dim). got shape={tuple(c.shape)}")
 
@@ -122,32 +128,24 @@ def _encode_cap_feats(pipe: ZImagePipeline, texts: List[str], device: str):
     return cap_list
 
 
-
-def _sample_sigma_and_noisy_latents(pipe, latents: torch.Tensor):
-    """
-    FlowMatchEulerDiscreteScheduler is sigma-based. We'll sample a sigma and add noise.
-    Returns: noisy_latents, sigma_tensor
-    """
-    device = latents.device
-    dtype = latents.dtype
-
-    # Ensure scheduler has sigmas; if not, try set_timesteps to populate.
+def _ensure_scheduler_sigmas(pipe: ZImagePipeline, device: str) -> None:
     if not hasattr(pipe.scheduler, "sigmas") or pipe.scheduler.sigmas is None:
-        # Fallback: populate timesteps/sigmas
         nT = getattr(getattr(pipe.scheduler, "config", None), "num_train_timesteps", 1000)
         pipe.scheduler.set_timesteps(nT, device=device)
 
+
+def _sample_sigma_and_noisy_latents(pipe: ZImagePipeline, latents: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    device = latents.device
+    dtype = latents.dtype
+
+    _ensure_scheduler_sigmas(pipe, device=device)
     sigmas = pipe.scheduler.sigmas.to(device=device)
 
-    # sample an index in [0, len(sigmas)-1]
     idx = torch.randint(low=0, high=sigmas.shape[0], size=(latents.shape[0],), device=device)
     sigma = sigmas[idx].to(dtype=dtype)  # (B,)
 
     noise = torch.randn_like(latents)
-    # broadcast sigma -> (B,1,1,1)
-    sigma_b = sigma.view(-1, 1, 1, 1)
-    noisy = latents + noise * sigma_b
-
+    noisy = latents + noise * sigma.view(-1, 1, 1, 1)
     return noisy, sigma
 
 
@@ -162,23 +160,30 @@ def forward_generate_decoded_images(pipe: ZImagePipeline, texts: List[str], imag
     latent_w = image_size // 8
     latents = torch.randn((B, 4, latent_h, latent_w), device=device, dtype=dtype)
 
-    noisy_latents, sigma = _sample_sigma_and_noisy_latents(pipe, latents)  # noisy: (B,4,h,w), sigma: (B,)
+    noisy_latents, sigma = _sample_sigma_and_noisy_latents(pipe, latents)
 
-    # ✅ transformer expects x as list length B, each item is (C,H,W)
+    # transformer expects list length B, each item (C,H,W)
     x_list = [noisy_latents[i] for i in range(B)]
+
+    if DEBUG_SHAPES_ONCE:
+        print("DEBUG x_list[0]:", tuple(x_list[0].shape))
+        print("DEBUG cap_feats[0]:", tuple(cap_feats[0].shape), "dim=", cap_feats[0].dim())
+        print("DEBUG sigma:", tuple(sigma.shape))
+        # flip off for next steps
+        globals()["DEBUG_SHAPES_ONCE"] = False
 
     out = pipe.transformer(
         x=x_list,
-        t=sigma,          # keep as (B,) tensor
+        t=sigma,
         cap_feats=cap_feats,
         return_dict=True,
     )
 
     pred = out.sample if hasattr(out, "sample") else out
 
-    # ✅ output may also be list length B of (C,H,W); stack back to (B,C,H,W)
+    # pred is usually list length B of (C,H,W)
     if isinstance(pred, (list, tuple)):
-        pred_latents = torch.stack(pred, dim=0)
+        pred_latents = torch.stack(pred, dim=0)  # (B,4,h,w)
     else:
         pred_latents = pred
 
@@ -186,6 +191,11 @@ def forward_generate_decoded_images(pipe: ZImagePipeline, texts: List[str], imag
     decoded = pipe.vae.decode(pred_latents / sf).sample  # [-1,1]
     decoded = (decoded.clamp(-1, 1) + 1) / 2             # [0,1]
     return decoded
+
+
+# ============================================================
+# Train
+# ============================================================
 
 def train(cfg: TrainConfig) -> None:
     device = cfg.device if torch.cuda.is_available() else "cpu"
@@ -198,20 +208,17 @@ def train(cfg: TrainConfig) -> None:
     model = pipe.transformer
     model.train()
 
-    # NOTE: CLIP loss is frozen model, grads flow to decoded (and thus generator)
     aux_loss_fn = CLIPTextRegionLoss(device=device)
-
     optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.lr)
 
-    use_amp = (device == "cuda") and (_resolve_dtype(cfg.dtype) in (torch.float16, torch.bfloat16))
-    scaler = torch.cuda.amp.GradScaler(enabled=(use_amp and _resolve_dtype(cfg.dtype) == torch.float16))
+    dtype = _resolve_dtype(cfg.dtype)
+    use_autocast = (device == "cuda") and (dtype in (torch.float16, torch.bfloat16))
+    scaler = torch.cuda.amp.GradScaler(enabled=(device == "cuda" and dtype == torch.float16))
 
-    # For logging parameter updates
     probe_param = _pick_probe_param(model)
 
-    # Dataloader
-    train_loader = _build_loaders(cfg)
-    train_iter = iter(train_loader)
+    loader = _build_loader(cfg)
+    it = iter(loader)
 
     optimizer.zero_grad(set_to_none=True)
 
@@ -220,30 +227,21 @@ def train(cfg: TrainConfig) -> None:
 
     while global_step < cfg.num_steps:
         try:
-            batch = next(train_iter)
+            batch = next(it)
         except StopIteration:
-            train_iter = iter(train_loader)
-            batch = next(train_iter)
+            it = iter(loader)
+            batch = next(it)
 
         micro_step += 1
 
-        pixel_values: torch.Tensor = batch["pixel_values"].to(device, non_blocking=True)  # (B,3,H,W)
-        bboxes: torch.Tensor = batch["bboxes"].to(device, non_blocking=True)              # (B,4)
+        bboxes: torch.Tensor = batch["bboxes"].to(device, non_blocking=True)
         texts: List[str] = batch["texts"]
 
-        # snapshot for Δw (only at start of accumulation cycle to keep it meaningful)
-        if micro_step % cfg.grad_accum == 1:
-            before = probe_param.detach().float().clone()
-        else:
-            before = None
-
         # ----------------------------
-        # Forward: two modes
+        # Forward
         # ----------------------------
-        if cfg.sanity_mode:
-            # "proof-of-update" loss. Cheap and guarantees weight updates if optimizer works.
-            # We only use a few parameter tensors to avoid huge compute.
-            with torch.cuda.amp.autocast(enabled=use_amp):
+        if SANITY_MODE:
+            with torch.cuda.amp.autocast(enabled=use_autocast):
                 loss = 0.0
                 c = 0
                 for p in model.parameters():
@@ -253,21 +251,19 @@ def train(cfg: TrainConfig) -> None:
                     c += 1
                     if c >= 8:
                         break
-                loss = loss / max(c, 1)
-                # scale by grad_accum for proper accumulation
-                loss = loss / cfg.grad_accum
-
+                loss = (loss / max(c, 1)) / cfg.grad_accum
         else:
-            # REAL mode: you must produce decoded images from the model in a differentiable way.
-            # If you paste the original forward from your previous training code,
-            # I will replace this block with the correct implementation.
-            decoded = forward_generate_decoded_images(pipe, texts=texts, image_size=cfg.image_size)
-            with torch.cuda.amp.autocast(enabled=use_amp):
-                aux_loss = aux_loss_fn(decoded, bboxes=bboxes, texts=texts)
-                loss = (cfg.lambda_aux * aux_loss) / cfg.grad_accum
+            # compute aux every aux_every micro-steps
+            if (micro_step % cfg.aux_every) == 0:
+                decoded = forward_generate_decoded_images(pipe, texts=texts, image_size=cfg.image_size)
+                with torch.cuda.amp.autocast(enabled=use_autocast):
+                    aux = aux_loss_fn(decoded, bboxes=bboxes, texts=texts)
+                    loss = (cfg.lambda_aux * aux) / cfg.grad_accum
+            else:
+                loss = torch.zeros((), device=device, dtype=torch.float32)
 
         # ----------------------------
-        # Backward (AMP-safe)
+        # Backward
         # ----------------------------
         if scaler.is_enabled():
             scaler.scale(loss).backward()
@@ -275,12 +271,14 @@ def train(cfg: TrainConfig) -> None:
             loss.backward()
 
         # ----------------------------
-        # Optimizer step every grad_accum micro-steps
+        # Optimizer step (every grad_accum micro-steps)
         # ----------------------------
         if micro_step % cfg.grad_accum == 0:
             global_step += 1
 
-            # unscale before clipping if using fp16 scaler
+            # measure Δw on the actual optimizer step (never NaN)
+            before = probe_param.detach().float().clone()
+
             if scaler.is_enabled():
                 scaler.unscale_(optimizer)
 
@@ -295,20 +293,18 @@ def train(cfg: TrainConfig) -> None:
 
             optimizer.zero_grad(set_to_none=True)
 
-            # compute Δw once per optimizer step
             after = probe_param.detach().float()
-            delta_w = (after - before).abs().mean().item() if before is not None else float("nan")
+            delta_w = (after - before).abs().mean().item()
 
-            if (global_step % cfg.log_every) == 0 or global_step <= 3:
+            if global_step <= 3 or (global_step % LOG_EVERY == 0):
                 print(
                     f"[step {global_step}/{cfg.num_steps}] "
                     f"loss={float(loss.detach().cpu().item() * cfg.grad_accum):.6f} "
                     f"grad_norm={grad_norm_val:.4e} mean|Δw|={delta_w:.4e} "
-                    f"(sanity_mode={cfg.sanity_mode})"
+                    f"(SANITY_MODE={SANITY_MODE})"
                 )
 
-            # optional memory cleanup
-            if device == "cuda" and (global_step % (cfg.log_every * 4) == 0):
+            if device == "cuda" and (global_step % (LOG_EVERY * 4) == 0):
                 torch.cuda.empty_cache()
                 gc.collect()
 
