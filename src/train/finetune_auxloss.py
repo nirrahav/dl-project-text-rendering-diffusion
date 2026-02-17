@@ -13,7 +13,7 @@ from torch.utils.data import DataLoader
 from diffusers import ZImagePipeline
 
 from src.losses.clip_text_region_loss import CLIPTextRegionLoss
-from src.config.train_config import TrainConfig
+from src.config import TrainConfig
 
 # UPDATE THIS IMPORT PATH to where you saved SynthTextDataset
 from src.data.synth_text_dataset import SynthTextDataset, collate_fn
