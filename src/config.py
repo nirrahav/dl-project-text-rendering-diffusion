@@ -3,8 +3,8 @@ from dataclasses import dataclass
 @dataclass
 class TrainConfig:
     # Model
-    model_id: str = "Tongyi-MAI/Z-Image-Turbo"   # can switch to Z-Image-Base if released/supports finetune
-    dtype: str = "bf16"                          # "fp16" / "bf16" / "fp32"
+    model_id: str = "Tongyi-MAI/Z-Image-Turbo"
+    dtype: str = "bf16"        # "fp16" / "bf16" / "fp32"
     device: str = "cuda"
 
     # Data
@@ -21,11 +21,14 @@ class TrainConfig:
     max_grad_norm: float = 1.0
     aux_every: int = 4
 
-
     # Loss weights
-    lambda_aux: float = 0.2  # weight for text-region auxiliary loss
+    lambda_aux: float = 0.2
 
     # Output
     out_dir: str = "outputs"
     ckpt_dir: str = "checkpoints"
     seed: int = 42
+
+    # Debug / sanity
+    sanity_mode: bool = True   # True = verify optimizer updates weights (no diffusion forward needed yet)
+    log_every: int = 25

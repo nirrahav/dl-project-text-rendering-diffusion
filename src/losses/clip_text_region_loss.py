@@ -8,26 +8,25 @@ from transformers import CLIPProcessor, CLIPModel
 def _extract_tensor(x: object) -> torch.Tensor:
     """
     HF compatibility helper:
-    Some transformers versions may return ModelOutput objects instead of tensors.
-    This function tries common fields in order and falls back to x if it's already a Tensor.
+    transformers may return ModelOutput objects instead of raw tensors.
+    Extract common tensor fields and fall back to x if it's already a Tensor.
     """
     if torch.is_tensor(x):
         return x  # type: ignore[return-value]
 
-    # Common CLIP / ModelOutput fields
     for attr in ("image_embeds", "text_embeds", "pooler_output", "embeds", "last_hidden_state"):
         if hasattr(x, attr):
             v = getattr(x, attr)
             if torch.is_tensor(v):
                 return v  # type: ignore[return-value]
 
-    raise TypeError(f"Expected a Tensor or ModelOutput containing tensor fields, got: {type(x)}")
+    raise TypeError(f"Expected Tensor or ModelOutput with tensor fields, got: {type(x)}")
 
 
 class CLIPTextRegionLoss(torch.nn.Module):
     """
     Cosine distance between CLIP(image_crop) and CLIP(text).
-    Differentiable w.r.t. image pixels (no_grad only on CLIP; gradients flow to generator).
+    Differentiable w.r.t. image pixels (CLIP is frozen).
     """
 
     def __init__(self, clip_id: str = "openai/clip-vit-base-patch32", device: str = "cuda"):
@@ -58,7 +57,6 @@ class CLIPTextRegionLoss(torch.nn.Module):
 
         t_out = self.clip.get_text_features(**inputs)
         t = _extract_tensor(t_out)
-
         return F.normalize(t, dim=-1)
 
     def forward(self, image_batch: torch.Tensor, bboxes: torch.Tensor, texts: List[str]) -> torch.Tensor:
@@ -81,11 +79,11 @@ class CLIPTextRegionLoss(torch.nn.Module):
 
         crops = torch.cat(crops, dim=0)  # (B,3,224,224)
 
-        # Match CLIP dtype (fp16)
+        # Match CLIP dtype
         clip_dtype = next(self.clip.parameters()).dtype
         crops = crops.to(dtype=clip_dtype)
 
-        # CLIP normalization (keep dtype/device to avoid fp32 upcast)
+        # CLIP normalization (same dtype/device)
         mean = torch.tensor([0.48145466, 0.4578275, 0.40821073],
                             device=crops.device, dtype=clip_dtype).view(1, 3, 1, 1)
         std = torch.tensor([0.26862954, 0.26130258, 0.27577711],
