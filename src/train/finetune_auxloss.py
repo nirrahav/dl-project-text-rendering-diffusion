@@ -264,8 +264,7 @@ def train(cfg: TrainConfig) -> None:
                     aux = aux_loss_fn(decoded, bboxes=bboxes, texts=texts)
                     loss = (cfg.lambda_aux * aux) / cfg.grad_accum
             else:
-                loss = torch.zeros((), device=device, dtype=torch.float32)
-
+                loss = (probe_param.sum() * 0.0) / cfg.grad_accum  # dummy loss to check optimizer updates weights when aux is not computed
         # ----------------------------
         # Backward
         # ----------------------------
