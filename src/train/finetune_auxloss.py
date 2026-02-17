@@ -347,7 +347,7 @@ def train(cfg: TrainConfig) -> None:
                 print(
                     f"[step {global_step}/{cfg.num_steps}] "
                     f"loss={float(loss.detach().cpu().item() * cfg.grad_accum):.6f} "
-                    f"grad_norm={grad_norm_val:.4e} mean|Δw|={delta_w:.4e}"
+                    f"grad_norm={grad_norm_val:.4e}"
                 )
 
             if device == "cuda" and (global_step % (log_every * 4) == 0):
