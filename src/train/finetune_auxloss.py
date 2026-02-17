@@ -164,17 +164,13 @@ def forward_generate_decoded_images(pipe: ZImagePipeline, texts: List[str], imag
     latent_w = image_size // 8
     latents = torch.randn((B, 4, latent_h, latent_w), device=device, dtype=dtype)
 
-    noisy_latents, sigma = _sample_sigma_and_noisy_latents(pipe, latents)
+    noisy_latents, sigma = _sample_sigma_and_noisy_latents(pipe, latents)  # (B,4,h,w), (B,)
 
-    # transformer expects list length B, each item (C,H,W)
-    x_list = [noisy_latents[i] for i in range(B)]
+    # ✅ Z-Image expects (C,F,H,W). For static image, set F=1
+    noisy_latents = noisy_latents.unsqueeze(2)  # (B,4,1,h,w)
 
-    if DEBUG_SHAPES_ONCE:
-        print("DEBUG x_list[0]:", tuple(x_list[0].shape))
-        print("DEBUG cap_feats[0]:", tuple(cap_feats[0].shape), "dim=", cap_feats[0].dim())
-        print("DEBUG sigma:", tuple(sigma.shape))
-        # flip off for next steps
-        globals()["DEBUG_SHAPES_ONCE"] = False
+    # ✅ transformer expects list length B, each item (C,F,H,W)
+    x_list = [noisy_latents[i] for i in range(B)]  # each (4,1,h,w)
 
     out = pipe.transformer(
         x=x_list,
@@ -185,11 +181,15 @@ def forward_generate_decoded_images(pipe: ZImagePipeline, texts: List[str], imag
 
     pred = out.sample if hasattr(out, "sample") else out
 
-    # pred is usually list length B of (C,H,W)
+    # pred is usually list length B of (C,F,H,W). stack -> (B,C,F,H,W)
     if isinstance(pred, (list, tuple)):
-        pred_latents = torch.stack(pred, dim=0)  # (B,4,h,w)
+        pred_latents = torch.stack(pred, dim=0)
     else:
         pred_latents = pred
+
+    # ✅ VAE expects (B,4,H,W) so drop F dimension
+    if pred_latents.dim() == 5:
+        pred_latents = pred_latents[:, :, 0]  # take frame 0 => (B,4,h,w)
 
     sf = getattr(getattr(pipe.vae, "config", None), "scaling_factor", 0.18215)
     decoded = pipe.vae.decode(pred_latents / sf).sample  # [-1,1]
