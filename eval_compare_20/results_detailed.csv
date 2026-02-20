@@ -1,0 +1,21 @@
+idx,prompt,clip_base,clip_ft,delta_clip,cer_base,cer_ft,delta_cer,exact_base,exact_ft,delta_exact
+1,"A clean white poster with the word ""HELLO"" in bold black uppercase letters, centered",0.361581951379776,0.36320093274116516,0.0016189813613891602,1.0,1.0,0.0,0,0,0
+2,"A street sign that clearly reads ""STOP"" in red letters on a white background, close-up",0.3633050322532654,0.36264073848724365,-0.0006642937660217285,1.0,1.0,0.0,0,0,0
+3,"A coffee shop menu board showing the word ""LATTE"" in large chalk handwriting",0.426037073135376,0.4286274313926697,0.002590358257293701,1.2236842105263157,1.5394736842105263,-0.3157894736842106,0,0,0
+4,"A book cover with the title ""DATA SCIENCE"" in big blue letters on a yellow background",0.3561910390853882,0.3552740514278412,-0.0009169876575469971,0.9176470588235294,0.9176470588235294,0.0,0,0,0
+5,"A minimal logo with the text ""NIR"" in modern sans-serif, black on white",0.3632969558238983,0.36555546522140503,0.002258509397506714,1.0,1.0,0.0,0,0,0
+6,"A license plate that reads ""AI2026"" clearly, centered, high contrast",0.35242119431495667,0.35787492990493774,0.005453735589981079,1.0,1.0,0.0,0,0,0
+7,"A neon sign glowing that says ""OPEN"" at night, high contrast, readable text",0.34650784730911255,0.3516470789909363,0.0051392316818237305,1.0,1.0,0.0,0,0,0
+8,"A classroom whiteboard with ""RECURSION"" written neatly in black marker",0.3329138457775116,0.33248651027679443,-0.0004273355007171631,0.8857142857142857,0.8428571428571429,0.042857142857142816,0,0,0
+9,"A road billboard with the word ""ISRAEL"" in large clear letters, daytime",0.39503952860832214,0.3832469582557678,-0.011792570352554321,1.0,1.0,0.0,0,0,0
+10,"A phone lock screen showing the time ""10:15"" in large digits, crisp",0.32638171315193176,0.32797038555145264,0.001588672399520874,1.0,1.0,0.0,0,0,0
+11,"A product label that reads ""MILK"" in bold letters, studio lighting, sharp focus",0.3497081696987152,0.3505917489528656,0.0008835792541503906,1.0,1.0,0.0,0,0,0
+12,"A vintage poster with the word ""MUSIC"" in large typography, centered",0.36261996626853943,0.3605276942253113,-0.0020922720432281494,1.0,1.0,0.0,0,0,0
+13,"A warning label that says ""DANGER"" in black letters on a yellow sign, close-up",0.32373449206352234,0.32632535696029663,0.002590864896774292,1.0,1.0,0.0,0,0,0
+14,"A notebook page with the handwritten word ""PYTHON"" clearly visible",0.3609426021575928,0.3593379557132721,-0.0016046464443206787,1.0,1.0,0.0,0,0,0
+15,"A street mural that contains the word ""PEACE"" in big letters, vibrant colors, readable",0.37141162157058716,0.3748556673526764,0.0034440457820892334,1.0,1.0,0.0,0,0,0
+16,"A clean UI button with the text ""SUBMIT"" in all caps, centered, high contrast",0.3492295742034912,0.3508729934692383,0.0016434192657470703,0.8961038961038961,0.9090909090909091,-0.012987012987012991,0,0,0
+17,"A delivery box with a sticker that says ""FRAGILE"" clearly, studio photo",0.39176100492477417,0.3975387513637543,0.0057777464389801025,1.0,1.0,0.0,0,0,0
+18,"A scoreboard showing ""HOME 3"" and ""AWAY 1"" in large digits, sharp and readable",0.3699464797973633,0.35486891865730286,-0.015077561140060425,0.9871794871794872,0.8717948717948718,0.11538461538461542,0,0,0
+19,"A minimal poster with the text ""GOOD VIBES"" in bold black letters on white",0.3650989234447479,0.36719632148742676,0.002097398042678833,1.0,0.9459459459459459,0.05405405405405406,0,0,0
+20,"A sign on a door that says ""PUSH"" in large uppercase letters, close-up",0.38916072249412537,0.3908516466617584,0.0016909241676330566,1.0,1.0,0.0,0,0,0
