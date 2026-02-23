@@ -106,7 +106,6 @@ Course Project – Deep Learning
 ## Notes and Future Work
 
 This project focuses on qualitative improvements in text rendering. Possible future extensions include:
-- OCR-based quantitative evaluation (e.g., CER/WER)
 - Extension to additional languages
 - Adaptive weighting of the auxiliary loss
 - Application to other diffusion-based architectures
