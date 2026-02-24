@@ -251,13 +251,12 @@ def train(cfg: TrainConfig) -> None:
     # ---- build ----
     pipe = _build_pipe(cfg, device=device)
 
-    # ---- freeze non-train parts (recommended) ----
+    # ---- freeze non-train parts ----
     for p in pipe.vae.parameters():
         p.requires_grad_(False)
     for p in pipe.text_encoder.parameters():
         p.requires_grad_(False)
 
-    # ---- IMPORTANT FIX (recommended): keep trainable weights FP32 when using GradScaler ----
     amp_dtype = _resolve_dtype(cfg.dtype)  # this is the autocast dtype (fp16/bf16/fp32)
     if device == "cuda" and amp_dtype == torch.float16:
         pipe.transformer.to(torch.float32)
@@ -302,7 +301,7 @@ def train(cfg: TrainConfig) -> None:
         # ---- forward ----
         if (micro_step % cfg.aux_every) == 0:
             # Put the FULL forward (including transformer+vae decode) inside autocast
-            # so compute is fp16/bf16 while weights remain fp32 (recommended).
+            # so compute is fp16/bf16 while weights remain fp32.
             with autocast(device_type="cuda", enabled=use_amp, dtype=amp_dtype):
                 decoded = forward_generate_decoded_images(pipe, texts=texts, image_size=cfg.image_size)
                 aux = aux_loss_fn(decoded, bboxes=bboxes, texts=texts)
@@ -324,7 +323,6 @@ def train(cfg: TrainConfig) -> None:
             before = probe_param.detach().float().clone()
 
             if scaler.is_enabled():
-                # This will now work because grads are NOT fp16 (weights are fp32)
                 scaler.unscale_(optimizer)
 
             grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.max_grad_norm)

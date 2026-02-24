@@ -1,118 +1,149 @@
-# Improving Text Rendering in Diffusion Models via Auxiliary Loss
+# Improving Text Rendering in Diffusion Models via Auxiliary Loss  
+### Deep Learning Final Project – BGU IEM 2026  
 
-This project explores a fine-tuning approach for improving text rendering quality in diffusion-based image generation models.
-
-We build on top of **Z-Image-Turbo**, a fast diffusion model optimized for few-step inference, and introduce a **text-aware auxiliary loss** that explicitly guides the model to generate clearer and more consistent text inside images.
-
-The key idea is to improve text readability **without modifying the original model architecture**, by extending the training objective.
-
----
-
-## Project Motivation
-
-Modern text-to-image diffusion models produce visually impressive images, but often struggle when rendering text inside images. Common issues include distorted characters, inconsistent spacing, and unreadable words. These errors are especially problematic because small visual inaccuracies can lead to large semantic mistakes.
-
-The problem becomes even more pronounced when moving beyond English to additional languages.
-
-This project addresses these limitations by introducing an explicit training signal that focuses on text quality.
+**Authors:**  
+Nir Rahav – rahavn@post.bgu.ac.il  
+Dana Benaim – dben@post.bgu.ac.il  
 
 ---
 
-## Method Overview
+## 📌 Overview
 
-The proposed approach extends the original training objective of Z-Image-Turbo
-by adding an auxiliary, text-aware loss. The original diffusion loss is kept
-unchanged, and the auxiliary loss is applied during fine-tuning.
+Diffusion-based text-to-image models generate visually coherent images from textual prompts.  
+However, text rendering inside generated images remains a persistent challenge.
 
-The combined objective is defined as:
+In most diffusion models, textual content emerges as a byproduct of the image generation process and is not explicitly optimized. As a result, generated text is often distorted, misspelled, or geometrically inconsistent.
 
-L_total = L_diffusion + λ · L_aux
+This project investigates whether introducing an **auxiliary text-aware loss** during fine-tuning can improve text rendering quality without modifying the original model architecture.
+
+---
+
+## 🧠 Motivation
+
+Text rendering is inherently difficult for diffusion models because:
+
+- Image generation is continuous and probabilistic.
+- Text is discrete and structurally constrained.
+- Small pixel deviations can change character identity.
+- High CLIP similarity does not guarantee readable text.
+
+We aim to bridge this gap using targeted objective-level supervision.
+
+---
+
+## 🏗 Base Model
+
+We fine-tune the publicly available:
+
+> **Tongyi-MAI Z-Image-Turbo**
+
+Z-Image-Turbo is a diffusion-based foundation model built on a Scalable Single-Stream Diffusion Transformer (S3-DiT).  
+It demonstrates strong bilingual capabilities but does not explicitly optimize for character-level textual correctness.
+
+---
+
+## 🔬 Method
+
+We introduce an auxiliary loss term focused on improving textual rendering quality.
+
+The training objective is modified as:
+
+\[
+L_{total} = L_{diffusion} + \lambda L_{aux}
+\]
 
 Where:
-- **L_diffusion** is the original diffusion training loss  
-- **L_aux** is the text-aware auxiliary loss  
-- **λ** controls the influence of the auxiliary loss
+
+- `L_diffusion` – standard diffusion noise prediction loss  
+- `L_aux` – text-aware auxiliary supervision  
+- `λ = 0.2` – weighting coefficient  
+
+Key design principles:
+
+- ✅ No architectural changes  
+- ✅ No inference overhead  
+- ✅ Preserves original 8-step inference  
+- ✅ Fine-tuning at 512×512 resolution  
 
 ---
 
-## Training Pipeline
+## ⚙️ Training Setup
 
-The fine-tuning process follows these steps:
-
-1. Encode prompts and images using the pretrained pipeline  
-2. Perform a diffusion forward pass  
-3. Predict latent representations  
-4. Decode latents into images  
-5. Apply the auxiliary loss on text regions  
-6. Backpropagate the combined loss  
-
-No additional sampling steps or architectural changes are introduced during training.
+- Resolution: 512×512  
+- Auxiliary loss weight: λ = 0.2  
+- Controlled fine-tuning on pretrained Z-Image-Turbo  
+- Gradient accumulation used to simulate larger effective batch size under limited computational resources  
+- Evaluation performed on a controlled prompt set  
 
 ---
 
-## Experimental Setup
+## 📊 Evaluation Metrics
 
-- **Model:** Z-Image-Turbo (`Tongyi-MAI/Z-Image-Turbo`)  
-- **Image Resolution:** 512×512  
-- **Batch Size:** 1 (with gradient accumulation)  
-- **Precision:** bfloat16  
-- **Learning Rate:** 1e-5  
-- **Auxiliary Loss Weight (λ):** 0.2  
-- **Auxiliary Loss Frequency:** every 8 steps  
-- **Training Type:** Fine-tuning only  
+We evaluate both quantitatively and qualitatively.
 
----
+### Quantitative Metrics
 
-## Results
+- **CLIP Score** – semantic alignment between prompt and image  
+- **CER (Character Error Rate)** – OCR-based character-level error  
+- **Exact Match** – full string correctness  
 
-Qualitative comparisons between the baseline and fine-tuned models demonstrate clear improvements in text rendering quality.
+| Metric | Baseline | Fine-Tuned | Δ |
+|--------|----------|------------|---|
+| CLIP Score | 0.3629 | 0.3631 | +0.0002 |
+| CER | 0.9955 | 1.0013 | +0.0058 |
+| Exact Match | 0.0000 | 0.0000 | 0.0000 |
 
-Observed improvements include:
-- Sharper and more readable text
-- Improved alignment and spacing
-- More consistent character thickness
-- Reduced visual artifacts around letters
-
-All comparisons are performed using identical prompts and inference settings, isolating the effect of the auxiliary loss.
+While semantic alignment remained stable, no measurable improvement was observed in OCR-based metrics.
 
 ---
 
-## Usage
+### 👁 Qualitative Analysis
 
-### Training
+Despite limited quantitative gains, qualitative inspection reveals:
 
-Fine-tuning is performed using the configuration defined in `TrainConfig` and executed from the Colab notebook.  
-The training process updates only selected components of the model while preserving the original architecture.
+- Improved stroke consistency  
+- Sharper letter edges  
+- More stable geometric structure  
+- Better text alignment in structured layouts  
 
-### Inference and Evaluation
+However:
 
-The notebook demonstrates how to:
-- Generate baseline images using the pretrained model
-- Load fine-tuned transformer weights
-- Generate fine-tuned images
-- Perform a side-by-side qualitative comparison
+- Character-level distortions still appear  
+- Spacing inconsistencies remain  
+- Thin fonts and digital-style displays remain sensitive to artifacts  
 
----
-
-## Authors
-
-- **Nir Rahav**
-- **Dana Benaim**
-
-Course Project – Deep Learning
+This highlights the discrepancy between automated metrics and human perception.
 
 ---
 
-## Notes and Future Work
+## 🎯 Contributions
 
-This project focuses on qualitative improvements in text rendering. Possible future extensions include:
-- Extension to additional languages
-- Adaptive weighting of the auxiliary loss
-- Application to other diffusion-based architectures
+- Introduced a text-aware auxiliary loss integrated at the objective level  
+- Demonstrated that controlled fine-tuning can improve typographic stability  
+- Preserved original architecture and inference configuration  
+- Showed that visual improvements do not necessarily translate to symbolic correctness  
 
 ---
 
-## Acknowledgments
+## 🚧 Limitations
 
-- **Z-Image-Turbo** by Tongyi-MAI  
-- **Hugging Face Diffusers** library  
+- No measurable improvement in CER or Exact Match  
+- Improvements primarily aesthetic rather than symbolic  
+- Limited computational budget  
+- Evaluation lacks systematic human study  
+
+---
+
+## 🔮 Future Work
+
+- Incorporate structured human evaluation  
+- Refine loss formulation for stronger character-level supervision  
+- Explore alternative training configurations  
+- Extend support to additional languages  
+- Investigate multilingual and complex writing systems  
+
+---
+
+## 🏁 Final Remarks
+
+This project demonstrates that objective-level supervision can improve perceptual text quality in diffusion models, while also revealing the challenges of enforcing symbolic correctness in continuous generative frameworks.
