@@ -2,8 +2,7 @@
 ### Deep Learning Final Project – BGU IEM 2026  
 
 **Authors:**  
-Nir Rahav 
-Dana Benaim
+Nir Rahav & Dana Benaim
 
 ---
 
