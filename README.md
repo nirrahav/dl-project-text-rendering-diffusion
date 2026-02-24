@@ -2,8 +2,8 @@
 ### Deep Learning Final Project – BGU IEM 2026  
 
 **Authors:**  
-Nir Rahav – rahavn@post.bgu.ac.il  
-Dana Benaim – dben@post.bgu.ac.il  
+Nir Rahav 
+Dana Benaim
 
 ---
 
@@ -48,9 +48,7 @@ We introduce an auxiliary loss term focused on improving textual rendering quali
 
 The training objective is modified as:
 
-\[
-L_{total} = L_{diffusion} + \lambda L_{aux}
-\]
+L_total = L_diffusion + λ * L_aux
 
 Where:
 
